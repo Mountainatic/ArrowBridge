@@ -1,0 +1,293 @@
+# 0001 xg_vm: retire userptr runs under the lock so the last unwire cannot be resurrected
+#
+# Base:  NvGfx xe 5a19a73f36249efb99c44c3f9cb34603ef0c0eb8 (XeGfx 0.0.44)
+# File:  gpu/xegfx/shim/src/fbsd/xg_vm.c (modified)
+# Apply: patch -p1 < patches/0001-xg_vm-userptr-race.patch
+#
+# Symptom: kernel panic "xegfx: vm: freeing wired page ... (ref 0x1)" while WindowServer
+# tears down an IOSurface that several i915 userptr objects share.  The page pin and the
+# last wire drop were not in one critical section, so a concurrent pin could raise the
+# reference count again after the final drop had already decided to free the page.
+#
+# Fix: mark shim USER pages with the private oflags bit XG_VPO_USERHOLD (0x40), route
+# vm_page_unwire()/vm_page_unwire_noq() through one xg_vm_user_unwire() that performs the
+# lookup, the vm_page_drop() and the trie retire under xg_vm_mtx, and make vm_page_free()
+# refuse a marked page.  Validated by a 40-minute userptr churn soak (527,696 churn
+# iterations, 1,583,088 surfaces created/freed, 0 panics).
+#
+
+--- a/gpu/xegfx/shim/src/fbsd/xg_vm.c
++++ b/gpu/xegfx/shim/src/fbsd/xg_vm.c
+@@ -83,6 +83,8 @@
+ #define	XG_RUN_KMEM	2	/* kmem_alloc_contig: also has a kernel mapping */
+ #define	XG_RUN_FICT	3	/* vm_phys_fictitious_reg_range: device memory, no backing */
+ #define	XG_RUN_USER	4	/* one wired page of a process (vm_fault_quick_hold_pages, X5) */
++/* page of an XG_RUN_USER run: vm_page_unwire*() must never hand it to vm_page_free() (see xg_vm_user_unwire) */
++#define	XG_VPO_USERHOLD	0x40	/* shim-only oflags bit; the standard VPO_* bits are 0x01..0x08 */
+ 
+ /* one IOKit wiring of a user range; every page run made from it holds a reference, the last one unwires the range */
+ struct xg_vm_hold {
+@@ -458,7 +460,137 @@
+ 	if (h != NULL && atomic_fetchadd_int(&h->refs, -1) == 1) {
+ 		xg_vm_x_release(h->xm);
+ 		free(h, M_XGVM);
++	}
++}
++
++/*
++ * X5 user page holds (see vm_fault_quick_hold_pages below) share one-page USER runs between every userptr object
++ * that pins the same page, and each pin adds one to the page's wiring.  LinuxKPI's put_page -> linux_free_pages
++ * -> vm_page_unwire*() must then not free the page (the run is ours, not an object page).  Accelerated
++ * WindowServer hits this a lot: ANV imports the same IOSurface through several userptr objects at once.
++ *
++ * The pin and the unwire both take xg_vm_mtx, and the unwire does its vm_page_drop() inside the same critical
++ * section that retires the run.  Invariants that makes true:
++ *   - a USER run in the page trie always has at least one wiring: a pin either finds it (and keeps it alive) or
++ *     finds no run and creates a fresh one;
++ *   - only the drop that takes the last wiring removes the run from the trie and retires it, so a thread that
++ *     just dropped a non-last wiring never touches the page after unlocking (it may be freed by the last drop);
++ *   - the caller of an unwire holds one wiring, so the vm_page itself is alive when the marker is read.
++ * Run lifetime is unchanged: the run's hold completes the IOKit wiring when the run is gone (outside the lock).
++ */
++static struct xg_vm_run *
++xg_vm_run_lookup_locked(vm_paddr_t pa)
++{
++	struct xg_vm_run *r;
++
++	r = XG_VM_RUN_PCTRIE_LOOKUP_LE(&xg_vm_runs, pa);
++	if (r != NULL && pa >= r->pa + ptoa(r->npages))
++		r = NULL;
++	return (r);
++}
++
++/* wire one page for a userptr hold; the page belongs to a USER run afterwards.  Returns NULL if it is not user memory. */
++static vm_page_t
++xg_vm_user_page_hold(vm_paddr_t pa, struct xg_vm_hold *h, int i, vm_offset_t start, int n)
++{
++	struct xg_vm_run *r;
++
++	for (;;) {
++		mtx_lock(&xg_vm_mtx);
++		r = xg_vm_run_lookup_locked(pa);
++		if (r != NULL) {
++			if (r->kind != XG_RUN_USER) {
++				/* a shim page mapped into a process (a GEM buffer's own pages): i915 refuses such userptrs too */
++				static volatile u_int logs;
++
++				mtx_unlock(&xg_vm_mtx);
++				if (atomic_fetchadd_int(&logs, 1) < 8)
++					printf("xegfx: userptr hold: page %d of 0x%lx (+%d) is a shim page (run kind %d), not user memory\n",
++					    i, (unsigned long)start, n, (int)r->kind);
++				return (NULL);
++			}
++			if (r->npages != 1)
++				panic("xegfx: vm: user run for page %p (pa 0x%lx) has %lu pages", &r->pages[0],
++				    (u_long)pa, (u_long)r->npages);
++			if (VPRC_WIRE_COUNT(r->pages[0].ref_count) == 0)
++				panic("xegfx: vm: pinning user page %p (pa 0x%lx) with no wiring", &r->pages[0],
++				    (u_long)pa);
++			atomic_add_int(&r->pages[0].ref_count, 1);
++			mtx_unlock(&xg_vm_mtx);
++			return (&r->pages[0]);
++		}
++		mtx_unlock(&xg_vm_mtx);
++		if ((r = xg_vm_run_new(1, XG_RUN_USER)) == NULL)
++			return (NULL);
++		r->pa = pa;
++		r->hold = h;
++		xg_vm_page_init(&r->pages[0], pa, VM_MEMATTR_DEFAULT);
++		r->pages[0].oflags |= XG_VPO_USERHOLD;
++		r->pages[0].ref_count = 1;
++		atomic_add_int(&h->refs, 1);
++		if (xg_vm_run_insert(r) == 0)
++			return (&r->pages[0]);
++		atomic_subtract_int(&h->refs, 1);	/* another hold inserted this page first: wire that one */
++		free(r, M_XGVM);
++	}
++}
++
++/*
++ * Drop one wiring of a user page and, when it was the last one, retire its run.  The drop happens under xg_vm_mtx:
++ * "drop the wiring" and "the run has no wiring left" have to be one decision, or two objects over the same page
++ * go away at the same time and the loser walks into a freed run (it would read m->phys_addr and m->oflags after
++ * the winner freed the run, and an unrelated run can reuse that address).
++ * The caller still holds one wiring of m, so m itself is alive here until the drop.
++ * TRUE means "this is a shim USER page; never hand it to vm_page_free()".
++ */
++static bool
++xg_vm_user_unwire(vm_page_t m)
++{
++	struct xg_vm_run *r, *dead = NULL;
++	struct xg_vm_hold *h = NULL;
++	u_int old;
++	bool ours;
++
++	if ((m->oflags & XG_VPO_USERHOLD) == 0)
++		return (false);
++	xg_vm_init();
++	mtx_lock(&xg_vm_mtx);
++	r = xg_vm_run_lookup_locked(m->phys_addr);
++	ours = r != NULL && r->kind == XG_RUN_USER && atop(m->phys_addr - r->pa) < r->npages &&
++	    m == &r->pages[atop(m->phys_addr - r->pa)];
++	old = vm_page_drop(m, 1);
++	if (VPRC_WIRE_COUNT(old) == 0) {
++		mtx_unlock(&xg_vm_mtx);
++		panic("xegfx: vm: unwire of unwired user page %p (pa 0x%lx, ref 0x%x)", m,
++		    (u_long)m->phys_addr, old);
+ 	}
++	if (ours && VPRC_WIRE_COUNT(old) == 1) {
++		/* last wiring: the run is finished here and no pin can find it in the trie any more */
++		XG_VM_RUN_PCTRIE_REMOVE(&xg_vm_runs, r->pa);
++		dead = r;
++		h = r->hold;
++		r->hold = NULL;
++		atomic_set_long(&r->nlive, 0);
++	}
++	mtx_unlock(&xg_vm_mtx);
++	if (!ours) {
++		/* invariant break, not a race: a marked page always lives in a USER run.  Print outside the lock. */
++		static volatile u_int logs;
++
++		if (atomic_fetchadd_int(&logs, 1) < 8)
++			printf("xegfx: vm: user page %p (pa 0x%lx, ref 0x%x) has no USER run\n", m,
++			    (u_long)m->phys_addr, old);
++	}
++	if (dead != NULL) {
++		/*
++		 * The run is already out of the trie (a pin cannot find it again), so it is finished here rather than
++		 * in xg_vm_run_destroy(); the hold release may sleep and runs outside the lock.
++		 */
++		if (h != NULL)
++			xg_vm_hold_put(h);
++		free(dead, M_XGVM);
++	}
++	return (true);
+ }
+ 
+ static void
+@@ -472,6 +604,7 @@
+ 	XG_VM_RUN_PCTRIE_REMOVE(&xg_vm_runs, r->pa);
+ 	mtx_unlock(&xg_vm_mtx);
+ 	if (r->kind == XG_RUN_USER) {
++		/* unreachable: the last unwire retires USER runs in xg_vm_user_unwire(); kept for completeness */
+ 		xg_vm_hold_put(r->hold);
+ 		free(r, M_XGVM);
+ 		return;
+@@ -568,6 +701,14 @@
+ 		panic("xegfx: vm: free of page %p (pa 0x%lx) the shim does not own", m, (u_long)m->phys_addr);
+ 	if (r->kind == XG_RUN_FICT)
+ 		return;
++	if (r->kind == XG_RUN_USER) {
++		/* the last unwire retires USER runs in xg_vm_user_unwire(); getting here would leak the run */
++		static volatile u_int logs;
++
++		if (atomic_fetchadd_int(&logs, 1) < 8)
++			printf("xegfx: vm: page_release on USER page %p (pa 0x%lx)\n", m, (u_long)m->phys_addr);
++		return;
++	}
+ 	if (atomic_fetchadd_long(&r->nlive, -1) == 1)
+ 		xg_vm_run_destroy(r);
+ }
+@@ -865,6 +1006,15 @@
+ void
+ vm_page_free(vm_page_t m)
+ {
++	if ((m->oflags & XG_VPO_USERHOLD) != 0) {
++		/* xg_vm_user_unwire() keeps these away from here; last line of defence, losing one here leaks its run */
++		static volatile u_int logs;
++
++		if (atomic_fetchadd_int(&logs, 1) < 8)
++			printf("xegfx: vm: refusing to free user-held page %p (pa 0x%lx)\n", m,
++			    (u_long)m->phys_addr);
++		return;
++	}
+ 	m->flags &= ~PG_ZERO;
+ 	if (m->object != NULL) {
+ 		VM_OBJECT_ASSERT_WLOCKED(m->object);
+@@ -893,10 +1043,17 @@
+ bool
+ vm_page_unwire_noq(vm_page_t m)
+ {
+-	u_int old = vm_page_drop(m, 1);
++	u_int old;
+ 
++	/*
++	 * Shim X5 user pages drop their wiring and retire their run inside xg_vm_user_unwire(); they must never be
++	 * handed to vm_page_free() (that was the "freeing wired page ... (ref 0x1)" panic).
++	 */
++	if (xg_vm_user_unwire(m))
++		return (false);
++	old = vm_page_drop(m, 1);
+ 	if (VPRC_WIRE_COUNT(old) == 0)
+-		panic("xegfx: vm: unwire of unwired page %p", m);
++		panic("xegfx: vm: unwire of unwired page %p (pa 0x%lx, ref 0x%x)", m, (u_long)m->phys_addr, old);
+ 	return (VPRC_WIRE_COUNT(old) == 1);
+ }
+ 
+@@ -904,10 +1061,13 @@
+ void
+ vm_page_unwire(vm_page_t m, uint8_t queue)
+ {
+-	u_int old = vm_page_drop(m, 1);
++	u_int old;
+ 
++	if (xg_vm_user_unwire(m))
++		return;
++	old = vm_page_drop(m, 1);
+ 	if (VPRC_WIRE_COUNT(old) == 0)
+-		panic("xegfx: vm: unwire of unwired page %p", m);
++		panic("xegfx: vm: unwire of unwired page %p (pa 0x%lx, ref 0x%x)", m, (u_long)m->phys_addr, old);
+ 	if ((old & ~VPRC_BLOCKED) == 1)
+ 		vm_page_free(m);
+ }
+@@ -1737,8 +1897,9 @@
+  * X5 user page holds for i915 userptr (ANV's VK_EXT_external_memory_host): the range of the calling process is wired
+  * through IOKit (the map argument is the shim's proc0 for every process, so the task comes from the thread), and each
+  * page gets a one-page USER run so PHYS_TO_VM_PAGE and the vm_page wire counts work as on FreeBSD. LinuxKPI's
+- * put_page unwires a page; its last unwire frees the run, and the last run of a hold completes the IOKit wiring. A
+- * page held twice (two userptr objects over one buffer) is wired again on its existing run.
++ * put_page unwires a page; its last unwire retires the run (xg_vm_user_unwire(), under the run lock so that a
++ * concurrent pin cannot resurrect the page), and the last run of a hold completes the IOKit wiring. A page held twice
++ * (two userptr objects over one buffer) is wired again on its existing run.
+  */
+ int
+ vm_fault_quick_hold_pages(vm_map_t map, vm_offset_t addr, vm_size_t len, vm_prot_t prot, vm_page_t *ma,
+@@ -1768,34 +1929,11 @@
+ 		return (-1);
+ 	}
+ 	for (i = 0; i < n; i++) {
+-		struct xg_vm_run *r;
++		vm_page_t m = xg_vm_user_page_hold(pa[i], h, i, start, n);
+ 
+-		for (;;) {
+-			if ((r = xg_vm_run_find(pa[i])) != NULL) {
+-				if (r->kind != XG_RUN_USER) {
+-					/* a shim page mapped into a process (a GEM buffer's own pages): i915 refuses such userptrs too */
+-					static volatile u_int logs;
+-					if (atomic_fetchadd_int(&logs, 1) < 8)
+-						printf("xegfx: userptr hold: page %d of 0x%lx (+%d) is a shim page (run kind %d), not user memory\n",
+-						    i, (unsigned long)start, n, (int)r->kind);
+-					goto fail;
+-				}
+-				atomic_add_int(&r->pages[0].ref_count, 1);
+-				break;
+-			}
+-			if ((r = xg_vm_run_new(1, XG_RUN_USER)) == NULL)
+-				goto fail;
+-			r->pa = pa[i];
+-			r->hold = h;
+-			xg_vm_page_init(&r->pages[0], pa[i], VM_MEMATTR_DEFAULT);
+-			r->pages[0].ref_count = 1;
+-			atomic_add_int(&h->refs, 1);
+-			if (xg_vm_run_insert(r) == 0)
+-				break;
+-			atomic_subtract_int(&h->refs, 1);	/* another hold inserted this page first: wire that one */
+-			free(r, M_XGVM);
+-		}
+-		ma[i] = &r->pages[0];
++		if (m == NULL)
++			goto fail;
++		ma[i] = m;
+ 	}
+ 	free(pa, M_XGVM);
+ 	xg_vm_hold_put(h);
