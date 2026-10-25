@@ -1,0 +1,586 @@
+# 0002 accel: register display head 4 and present in the panel's vblank
+#
+# Base:  NvGfx xe 5a19a73f36249efb99c44c3f9cb34603ef0c0eb8 (XeGfx 0.0.44)
+# Files: kexts/NVRM/accel/nvrm-accel.cpp (modified)
+#        kexts/NVRM/accel/xegfx_accel_names.h (new: sysctl-visible xegfxaccel_* aliases)
+# Apply: patch -p1 < patches/0002-accel-vblank-and-head4.patch
+#
+# The Intel panel reached over XeGfx is the only display this GPU has, and it is registered
+# as display head 4 (NMIntelFB / XeGfxIntelFramebuffer).  The accelerator now waits for the
+# framebuffer first-publish notification, maps BAR0 display MMIO, and copies each frame right
+# after the panel's vblank instead of on the submit path.  debug.xegfxaccel_iop_* counters
+# expose the wait, copy, transaction and gap times; debug.xegfxaccel_iop_vblank and
+# debug.xegfxaccel_iop_memcpy switch the two paths.  The nvaccel_* identifiers stay as they
+# are in the source; a macro list redirects them to xegfxaccel_* so every sysctl and log line
+# carries the XeGfx name instead of the NVIDIA accelerator name.
+#
+
+--- a/kexts/NVRM/accel/nvrm-accel.cpp
++++ b/kexts/NVRM/accel/nvrm-accel.cpp
+@@ -8,6 +8,7 @@
+ #ifdef NMX_ACCEL
+ // NMXAccel: this accelerator built for the AMD and Intel GPUs that NMXGPU drives (see nmx_accel_names.h)
+ #include "nmx_accel_names.h"
++#include "xegfx_accel_names.h"
+ #endif
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOLib.h>
+@@ -18,6 +19,7 @@
+ #include <pexpert/pexpert.h>
+ #include <libkern/OSKextLib.h>
+ #include <mach/kmod.h>
++#include <mach/mach_time.h>
+ #include <IOKit/IOBufferMemoryDescriptor.h>
+ #include <IOKit/IORangeAllocator.h>
+ #include "IOAccelerator.h"
+@@ -60,6 +62,7 @@
+ }
+ static volatile SInt64 gCntVmAlloc, gCntVmAllocBytes, gCntVmDealloc, gCntVmDeallocBytes, gCntVmRefused,
+                        gCntResNew, gCntResFree, gCntMapCommit, gCntMapRelease, gCntMapFree;
++static volatile uint32_t *gDispMmio = nullptr;   // BAR0 display registers, mapped in start() for the vblank wait
+ static void nvaccelInstallSysctl(void);
+ #ifdef NMX_XEGFX
+ extern SInt64 gCntPipeInit;
+@@ -82,7 +85,7 @@
+ static unsigned gNvHeadsPublished = 0, gNvHeadsRegistered = 0;
+ static unsigned gNvHeadsPiped = 0;
+ // The Intel built-in panel (head 4) joins only when this is 1. Off by default while the path is proven: a write at run
+-// time (then debug.nvaccelfb=3 and a WindowServer restart) can be undone by a reboot, so a hang never needs hands
++// time (then debug.xegfxaccelfb=3 and a WindowServer restart) can be undone by a reboot, so a hang never needs hands
+ // (the first virtual-panel test froze the machine at boot and needed a power cycle).
+ #ifdef NMX_XEGFX
+ static int gNvIgpu = 1;   // over XeGfx the Intel panel (NMIntelFB, head 4) is the only display this GPU has
+@@ -297,6 +300,7 @@
+     IONotifier *fFBNote = nullptr;
+     IONotifier *fIntelNote = nullptr;
+     IONotifier *fBootNote = nullptr;   // NMX_XEGFX: Apple's boot framebuffer on the iGPU
++    IONotifier *fXeNote = nullptr;     // NMX_XEGFX: XeGfxIntelFB's IONDRVFramebuffer subclass (Intel class name)
+     static NVAccel *gAccel;
+     IOService *fFB = nullptr;
+     IOService *volatile fFBs[kNvMaxFB] = {};
+@@ -350,10 +354,10 @@
+         unsigned before = me->fDM ? me->fDM->getFramebufferCount() : 0xFFFFFFFFu;
+         ALOG("%s published -- display machine framebuffer count = %u (index %u %s)", newService->getName(), before, idx, what);
+         if (gNvAccelArmed)
+-            ALOG("  index %u published AFTER the arm: it gets a pipe only when debug.nvaccelfb=3 is written again, "
++            ALOG("  index %u published AFTER the arm: it gets a pipe only when debug.xegfxaccelfb=3 is written again, "
+                  "and WindowServer composites it only after a WindowServer restart", idx);
+         else
+-            ALOG("  to register it:  sudo sysctl -w debug.nvaccelfb=1   (2 = re-run the family's own sweep)");
++            ALOG("  to register it:  sudo sysctl -w debug.xegfxaccelfb=1   (2 = re-run the family's own sweep)");
+         return true;
+     }
+     // Headless GPU (laptops whose panel and outputs are all on the Intel or AMD GPU: issues #76, #106). NVKMS finds no
+@@ -444,7 +448,7 @@
+                 break;
+             }
+             if (fFBRegistered & (1u << i)) continue;
+-            if (i == 4 && !gNvIgpu) break;   // the Intel panel waits for debug.nvaccel_igpu=1
++            if (i == 4 && !gNvIgpu) break;   // the Intel panel waits for debug.xegfxaccel_igpu=1
+             unsigned b = fDM->getFramebufferCount();
+             ALOG("  %s: calling found_framebuffer(%s index %u) -- count before %u", why, fb->getName(), i, b);
+             fDM->found_framebuffer((IOFramebuffer *)fb);
+@@ -490,7 +494,7 @@
+             setProperty("IOGLBundleName", "AppleMetalOpenGLRenderer");
+             ALOG("  IOGLBundleName=AppleMetalOpenGLRenderer -- NEW GL processes get a hardware renderer over Metal");
+         }
+-        ALOG("  debug.nvaccelfb now reads 1 -- armed-only Metal clients may have a device THIS BOOT ONLY "
++        ALOG("  debug.xegfxaccelfb now reads 1 -- armed-only Metal clients may have a device THIS BOOT ONLY "
+              "(heads published 0x%x, registered 0x%x, piped 0x%x)", gNvHeadsPublished, gNvHeadsRegistered, gNvHeadsPiped);
+     }
+     void registerFramebuffer(int how) {
+@@ -666,17 +670,17 @@
+         return kIOReturnSuccess;
+     }
+     static void triggerFromSysctl(int how) {
+-        if (!gAccel) { ALOG("sysctl debug.nvaccelfb=%d but no NVAccel is running", how); return; }
++        if (!gAccel) { ALOG("sysctl debug.xegfxaccelfb=%d but no NVAccel is running", how); return; }
+         if (how >= 4) gNvAperture = 1;
+         if (how >= 3) {
+             gNvScanout = 1;
+             ALOG("  level %d: registering any published head that has no pipe yet", how);
+             if (gAccel->fRegLock) IOLockLock(gAccel->fRegLock);
+             if (gAccel->registerFramebufferLocked(1))
+-                ALOG("sysctl debug.nvaccelfb=%d: scanout-backed display pipe ENABLED; the registration just delivered the mode "
++                ALOG("sysctl debug.xegfxaccelfb=%d: scanout-backed display pipe ENABLED; the registration just delivered the mode "
+                      "change -- not delivering it twice", how);
+             else {
+-                ALOG("sysctl debug.nvaccelfb=%d: scanout-backed display pipe ENABLED, re-delivering the mode change", how);
++                ALOG("sysctl debug.xegfxaccelfb=%d: scanout-backed display pipe ENABLED, re-delivering the mode change", how);
+                 gAccel->deliverModeChange();
+             }
+             if (gAccel->fRegLock) IOLockUnlock(gAccel->fRegLock);
+@@ -768,16 +772,31 @@
+                    "IOService::attach starts sleeping)", n, (unsigned)NV_CARRIERS); }
+             enableFromHook("start");
+             fPCI = OSDynamicCast(IOPCIDevice, provider);
++#ifdef NMX_XEGFX
++            // vblank sync: the display pipe's frame counter lives in BAR0 (display 14 register offsets, the same
++            // snapshot AGDC reads).  A read-only uncached map is enough and stays mapped for the boot.
++            if (fPCI) {
++                IOMemoryDescriptor *bar = fPCI->getDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0);
++                IOMemoryMap *map = bar ? bar->map(kIOMapInhibitCache) : nullptr;
++                if (map && map->getLength() >= 0x71000) {
++                    gDispMmio = (volatile uint32_t *)map->getVirtualAddress();
++                    ALOG("display MMIO %p: frames are copied right after the panel's vblank", gDispMmio);
++                } else {
++                    if (map) map->release();
++                    ALOG("display MMIO unavailable: frames are copied as soon as WindowServer sends them");
++                }
++            }
++#endif
+             ALOG("display machine framebuffer count after the family sweep = %u", fDM ? fDM->getFramebufferCount() : 0xFFFFFFFFu);
+             fRegLock = IOLockAlloc();
+             ALOG("multi-head: up to %u heads, registration lock %p%s", kNvMaxFB, fRegLock,
+                  fRegLock ? "" : " -- NULL: two sysctl writers could interleave a registration");
+ #if defined(NMX_XEGFX)
+             // over XeGfx the Intel GPU owns the built-in panel: NMIntelFB publishes it as head 4 and WindowServer
+-            // composites here once debug.nvaccelfb=1 registered it; frames reach the panel through the CPU copy path
++            // composites here once debug.xegfxaccelfb=1 registered it; frames reach the panel through the CPU copy path
+             nvaccelInstallSysctl();
+             gNvHeadless = 0;
+-            ALOG("Intel accelerator over XeGfx: watching for NMIntelFB (head 4); register with sysctl debug.nvaccelfb=1");
++            ALOG("Intel accelerator over XeGfx: watching for NMIntelFB (head 4); register with sysctl debug.xegfxaccelfb=1");
+             if (OSDictionary *im = serviceMatching("NMIntelFB")) {
+                 fIntelNote = addMatchingNotification(gIOFirstPublishNotification, im, &NVAccel::fbPublished, this, nullptr, 0);
+                 im->release();
+@@ -787,6 +806,11 @@
+                 fBootNote = addMatchingNotification(gIOFirstPublishNotification, bm, &NVAccel::fbPublished, this, nullptr, 0);
+                 bm->release();
+             }
++            // and XeGfxIntelFB publishes the panel under an Intel class name (CoreDisplay's vendor check, I-108)
++            if (OSDictionary *xm = serviceMatching("XeGfxIntelFramebuffer")) {
++                fXeNote = addMatchingNotification(gIOFirstPublishNotification, xm, &NVAccel::fbPublished, this, nullptr, 0);
++                xm->release();
++            }
+             OSDictionary *fbm = nullptr;
+ #elif defined(NMX_ACCEL)
+             // AMD/Intel: the Metal device is for apps; WindowServer draws into NMXGPU's framebuffer, and the plugin copies
+@@ -815,7 +839,7 @@
+                     fMetalPlugin = mp;
+                     removeProperty("MetalPluginName");
+                     ALOG("MetalPluginName withheld -- nothing will load the Metal plugin until "
+-                         "`sysctl -w debug.nvaccelfb=1` puts it back, and a reboot takes it away again");
++                         "`sysctl -w debug.xegfxaccelfb=1` puts it back, and a reboot takes it away again");
+                     armHeadlessCheck();
+                 }
+             } else ALOG("serviceMatching(NVRMFramebuffer) returned NULL -- cannot watch for the framebuffer");
+@@ -835,7 +859,7 @@
+ #endif
+     if (!gNvScanout) {
+         ALOG("NVDisplayPipe::initFramebufferResource(index %u): scanout gate CLOSED -- returning NULL, "
+-             "which is the family's own default (sysctl debug.nvaccelfb=3 opens it)", index);
++             "which is the family's own default (sysctl debug.xegfxaccelfb=3 opens it)", index);
+         return nullptr;
+     }
+     NVAccel *a = NVAccel::gAccel;
+@@ -858,7 +882,7 @@
+         // no NVIDIA VRAM address. No vidmem may stand for it (addToAperture/getApertureMemoryDescriptor would hand
+         // BAR1 offset 0 to the GPU), and none may be allocated in its place (fresh VRAM mapped here is the 10-10
+         // os_map_kernel_space hang shape). NULL is the family's own default: frames reach this panel only through
+-        // performTransaction's copy into kva (debug.nvaccel_iop_ok_h4 counts them).
++        // performTransaction's copy into kva (debug.xegfxaccel_iop_ok_h4 counts them).
+         ALOG("NVDisplayPipe::initFramebufferResource(head %u, index %u): CPU-only scanout %u x %u pitch %u (another GPU's "
+              "panel) -- no framebuffer resource, frames are copied", head, index, r.width, r.height, r.pitch);
+         return nullptr;
+@@ -913,7 +937,7 @@
+     if (!gNvAperture) {
+         if (fApLogged < 4) { fApLogged++;
+             ALOG("NVResource::getApertureMemoryDescriptor: aperture gate CLOSED -- returning nullptr "
+-                 "(sysctl debug.nvaccelfb=4 opens it)"); }
++                 "(sysctl debug.xegfxaccelfb=4 opens it)"); }
+         return nullptr;
+     }
+     if (fApDesc) return fApDesc;
+@@ -1083,6 +1107,54 @@
+ static int    gNvIop = 0;
+ static SInt64 gCntIopOk, gCntIopFail, gCntIopEmpty, gCntIopSrcRes, gCntIopSrcSurf, gCntIopBlank;
+ static SInt64 gCntIopOkHead[kNvMaxFB];
++
++// the display-pipe copy path's per-frame cost: the copy itself, the whole transaction, and the gap between
++// transactions, all in us.  The transaction runs on WindowServer's display thread, so txn is WindowServer's frame time.
++static SInt64 gIopCopyLastUs, gIopCopyMaxUs, gIopCopySumUs;
++static SInt64 gIopTxnLastUs, gIopTxnMaxUs, gIopTxnSumUs;
++static SInt64 gIopGapLastUs, gIopGapMaxUs, gIopGapSumUs;
++static uint64_t gIopLastTxnEnd;
++static int gIopMemcpy = 1;
++
++// vblank sync: the copy goes straight into the panel's framebuffer, so a copy that starts in the middle of a
++// scan shows its top half from this frame and its bottom half from the previous one (tearing).  The panel's
++// frame counter (BAR0 0x70040) goes up at every vblank; waiting for it makes the copy start right after the
++// panel begins scanning from the top, and the copy (2-4 ms against a 16.1 ms frame) stays ahead of the scan.
++static int gIopVblank = 1;
++static SInt64 gCntIopVblankWaits, gCntIopVblankSkips, gIopVblankLastUs, gIopVblankMaxUs;
++#define NV_DISP_FRAME_COUNTER 0x70040u
++
++extern "C" void absolutetime_to_nanoseconds(uint64_t abstime, uint64_t *result);
++static inline SInt64 nvIopUsBetween(uint64_t t0, uint64_t t1)
++{
++    uint64_t ns = 0;
++    absolutetime_to_nanoseconds(t1 - t0, &ns);
++    return (SInt64)(ns / 1000);
++}
++static inline void nvIopStat(SInt64 *last, SInt64 *max, SInt64 *sum, SInt64 v)
++{
++    *last = v;
++    if (v > *max) *max = v;
++    *sum += v;
++}
++
++// Waits for the panel's next vblank, then returns so the caller can copy while the scan is at the top of the
++// frame.  Bounded at ~1.5 frames: a display that is off or asleep must not hold the transaction.
++static void nvAccelIopWaitVblank(void)
++{
++    if (!gIopVblank || !gDispMmio) { OSAddAtomic64(1, &gCntIopVblankSkips); return; }
++    const uint32_t before = gDispMmio[NV_DISP_FRAME_COUNTER / 4];
++    const uint64_t t0 = mach_absolute_time();
++    for (;;) {
++        IOSleep(1);
++        if (gDispMmio[NV_DISP_FRAME_COUNTER / 4] != before) break;
++        if (nvIopUsBetween(t0, mach_absolute_time()) > 25000) { OSAddAtomic64(1, &gCntIopVblankSkips); return; }
++    }
++    const SInt64 us = nvIopUsBetween(t0, mach_absolute_time());
++    OSAddAtomic64(1, &gCntIopVblankWaits);
++    gIopVblankLastUs = us;
++    if (us > gIopVblankMaxUs) gIopVblankMaxUs = us;
++}
+ #define NVIOP_LOG_MAX 40
+ static unsigned gIopLogs = 0;
+ #define NVIOPLOG(fmt, ...) do { if (gIopLogs < NVIOP_LOG_MAX) { gIopLogs++; ALOG("iop: " fmt, ##__VA_ARGS__); } } while (0)
+@@ -1149,6 +1221,8 @@
+ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
+ {
+     NVPIPE_CNT(gCntPipePerform);
++    const uint64_t txnStart = mach_absolute_time();
++    if (gIopLastTxnEnd) nvIopStat(&gIopGapLastUs, &gIopGapMaxUs, &gIopGapSumUs, nvIopUsBetween(gIopLastTxnEnd, txnStart));
+     if (!gNvIop) return (IOReturn)0xe00002c7;
+     if (!txn) NVIOP_FAIL(kIOReturnBadArgument, "performTransaction(NULL)");
+     NVAccel *a = NVAccel::gAccel;
+@@ -1216,14 +1290,27 @@
+     if (w != q.width || h != q.height) NVIOP_FAIL(kIOReturnBadArgument, "source %ux%u is not the scanout's %ux%u", w, h, q.width, q.height);
+ 
+     nvAccelIopHome(fb, head);
++    nvAccelIopWaitVblank();
+     const unsigned words = (((pitch < q.pitch) ? pitch : q.pitch) & ~3u) / 4;
+     const unsigned spr = pitch / 4, dpr = q.pitch / 4;
+-    volatile unsigned int *d = (volatile unsigned int *)q.kva;
+-    for (unsigned y = 0; y < h; y++) {
+-        const volatile unsigned int *sp = src + (unsigned long)y * spr;
+-        volatile unsigned int *dp = d + (unsigned long)y * dpr;
+-        for (unsigned x = 0; x < words; x++) dp[x] = sp[x];
++    const uint64_t copyStart = mach_absolute_time();
++    if (gIopMemcpy) {
++        if (q.pitch == pitch) {
++            memcpy((void *)q.kva, (const void *)src, (size_t)h * (size_t)pitch);
++        } else {
++            for (unsigned y = 0; y < h; y++)
++                memcpy((char *)q.kva + (unsigned long)y * q.pitch,
++                       (const char *)src + (unsigned long)y * pitch, (size_t)words * 4);
++        }
++    } else {
++        volatile unsigned int *d = (volatile unsigned int *)q.kva;
++        for (unsigned y = 0; y < h; y++) {
++            const volatile unsigned int *sp = src + (unsigned long)y * spr;
++            volatile unsigned int *dp = d + (unsigned long)y * dpr;
++            for (unsigned x = 0; x < words; x++) dp[x] = sp[x];
++        }
+     }
++    nvIopStat(&gIopCopyLastUs, &gIopCopyMaxUs, &gIopCopySumUs, nvIopUsBetween(copyStart, mach_absolute_time()));
+     OSAddAtomic64(1, fromRes ? &gCntIopSrcRes : &gCntIopSrcSurf);
+     const SInt64 n = OSAddAtomic64(1, &gCntIopOk);
+     const SInt64 nh = OSAddAtomic64(1, &gCntIopOkHead[head]);
+@@ -1240,6 +1327,8 @@
+         ALOG("iop: K6 transaction #%lld (head %u #%lld) on the panel: %ux%u pitch %u from %s — 64 samples: nonzero %u varied %u", (long long)n, head, (long long)nh, w, h, pitch,
+              fromRes ? "our VRAM resource" : "the IOSurface's memory", nz, varied);
+     }
++    nvIopStat(&gIopTxnLastUs, &gIopTxnMaxUs, &gIopTxnSumUs, nvIopUsBetween(txnStart, mach_absolute_time()));
++    gIopLastTxnEnd = mach_absolute_time();
+     return kIOReturnSuccess;
+ }
+ 
+@@ -1258,11 +1347,11 @@
+         a->setProperty("IOAccelDisplayPipeCapabilities", caps);
+         caps->release();
+         gNvIop = 1;
+-        ALOG("iop: debug.nvaccel_iop=1 -- capabilities published, transaction hooks OPEN");
++        ALOG("iop: debug.xegfxaccel_iop=1 -- capabilities published, transaction hooks OPEN");
+     } else {
+         gNvIop = 0;
+         a->removeProperty("IOAccelDisplayPipeCapabilities");
+-        ALOG("iop: debug.nvaccel_iop=0 -- capabilities removed, transaction hooks answer as the base class");
++        ALOG("iop: debug.xegfxaccel_iop=0 -- capabilities removed, transaction hooks answer as the base class");
+     }
+     return 0;
+ }
+@@ -1308,7 +1397,7 @@
+             "bit i = head i's framebuffer was handed to the display machine (found_framebuffer)");
+ SYSCTL_UINT(_debug, OID_AUTO, nvaccel_heads_piped, CTLFLAG_RD | CTLFLAG_LOCKED, &gNvHeadsPiped, 0,
+             "bit i = head i has a display pipe that drives ITS OWN framebuffer (pipe+0x98 read back)");
+-static_assert(kNvMaxFB == 5, "kNvMaxFB changed: add debug.nvaccel_iop_ok_h<i> for every new head");
++static_assert(kNvMaxFB == 5, "kNvMaxFB changed: add debug.xegfxaccel_iop_ok_h<i> for every new head");
+ NVACCEL_CNT(nvaccel_iop_fail,         gCntIopFail,        "K3: transactions refused (see the capped iop: log lines)");
+ NVACCEL_CNT(nvaccel_iop_empty,        gCntIopEmpty,       "K3: transactions with no plane (gamma/options only)");
+ NVACCEL_CNT(nvaccel_iop_src_res,      gCntIopSrcRes,      "K3: frames sourced from our VRAM resource");
+@@ -1427,7 +1516,7 @@
+ static SInt64 gCntIopLate;
+ NVACCEL_CNT(nvaccel_iop_late,          gCntIopLate,         "frames kept on the panel because the previous flip had not reached it yet (framebuffer answered busy)");
+ static int gCrcHead = 0;
+-SYSCTL_INT(_debug, OID_AUTO, nvaccel_crc_head, CTLFLAG_RW | CTLFLAG_LOCKED, &gCrcHead, 0, "b85k-crc: which head debug.nvaccel_crc reads");
++SYSCTL_INT(_debug, OID_AUTO, nvaccel_crc_head, CTLFLAG_RW | CTLFLAG_LOCKED, &gCrcHead, 0, "b85k-crc: which head debug.xegfxaccel_crc reads");
+ static int nvaccel_crc_sysctl SYSCTL_HANDLER_ARGS;
+ SYSCTL_PROC(_debug, OID_AUTO, nvaccel_crc, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, nvaccel_crc_sysctl, "I",
+             "b85k-crc: display CRC32 of what head nvaccel_crc_head is showing (0 = unavailable)");
+@@ -1436,7 +1525,7 @@
+ {
+     if (gSysctlInstalled) return;
+ #if defined(NMX_ACCEL) && !defined(NMX_XEGFX)
+-    // only this one: the NVIDIA accelerator may be loaded too, and owns the debug.nvaccel* names
++    // only this one: the NVIDIA accelerator may be loaded too, and owns the debug.xegfxaccel* names
+     sysctl_register_oid(&sysctl__debug_nmxaccel_headless);
+     gSysctlInstalled = true;
+ #else
+@@ -1489,12 +1578,27 @@
+           sysctl__debug_nvaccel_pipe_complete, sysctl__debug_nvaccel_pipe_perform;
+       sysctl_register_oid(&sysctl__debug_nvaccel_pipe_init);     sysctl_register_oid(&sysctl__debug_nvaccel_pipe_validate);
+       sysctl_register_oid(&sysctl__debug_nvaccel_pipe_complete); sysctl_register_oid(&sysctl__debug_nvaccel_pipe_perform); }
++    { extern struct sysctl_oid sysctl__debug_nvaccel_iop_copy_last_us, sysctl__debug_nvaccel_iop_copy_max_us,
++          sysctl__debug_nvaccel_iop_copy_sum_us, sysctl__debug_nvaccel_iop_txn_last_us, sysctl__debug_nvaccel_iop_txn_max_us,
++          sysctl__debug_nvaccel_iop_txn_sum_us, sysctl__debug_nvaccel_iop_gap_last_us, sysctl__debug_nvaccel_iop_gap_max_us,
++          sysctl__debug_nvaccel_iop_gap_sum_us, sysctl__debug_nvaccel_iop_memcpy;
++      sysctl_register_oid(&sysctl__debug_nvaccel_iop_copy_last_us);  sysctl_register_oid(&sysctl__debug_nvaccel_iop_copy_max_us);
++      sysctl_register_oid(&sysctl__debug_nvaccel_iop_copy_sum_us);   sysctl_register_oid(&sysctl__debug_nvaccel_iop_txn_last_us);
++      sysctl_register_oid(&sysctl__debug_nvaccel_iop_txn_max_us);    sysctl_register_oid(&sysctl__debug_nvaccel_iop_txn_sum_us);
++      sysctl_register_oid(&sysctl__debug_nvaccel_iop_gap_last_us);   sysctl_register_oid(&sysctl__debug_nvaccel_iop_gap_max_us);
++      sysctl_register_oid(&sysctl__debug_nvaccel_iop_gap_sum_us);    sysctl_register_oid(&sysctl__debug_nvaccel_iop_memcpy); }
++    { extern struct sysctl_oid sysctl__debug_nvaccel_iop_vblank, sysctl__debug_nvaccel_iop_vblank_waits,
++          sysctl__debug_nvaccel_iop_vblank_skips, sysctl__debug_nvaccel_iop_vblank_last_us,
++          sysctl__debug_nvaccel_iop_vblank_max_us;
++      sysctl_register_oid(&sysctl__debug_nvaccel_iop_vblank);          sysctl_register_oid(&sysctl__debug_nvaccel_iop_vblank_waits);
++      sysctl_register_oid(&sysctl__debug_nvaccel_iop_vblank_skips);    sysctl_register_oid(&sysctl__debug_nvaccel_iop_vblank_last_us);
++      sysctl_register_oid(&sysctl__debug_nvaccel_iop_vblank_max_us); }
+     nvXeTraceStart();
+ #endif
+     sysctl_register_oid(&sysctl__debug_nvaccel_heads_published); sysctl_register_oid(&sysctl__debug_nvaccel_heads_registered);
+     sysctl_register_oid(&sysctl__debug_nvaccel_heads_piped);
+     gSysctlInstalled = true;
+-    ALOG("sysctl debug.nvaccelfb installed -- `sudo sysctl -w debug.nvaccelfb=1` registers the framebuffer");
++    ALOG("sysctl debug.xegfxaccelfb installed -- `sudo sysctl -w debug.xegfxaccelfb=1` registers the framebuffer");
+ #endif
+ }
+ 
+@@ -1641,7 +1745,7 @@
+ static inline void nvSVZero(void *p, unsigned long n) { volatile unsigned char *b = (volatile unsigned char *)p; while (n--) *b++ = 0; }
+ 
+ static unsigned gNVSVDirty, gNVSVDirtyRefused, gNVSVPageoff, gNVSVPageoffFail;
+-// sysctl debug.nvaccel_svdiag=N logs the next N surface dirty marks and page-offs (surface, result, path); 0 = off
++// sysctl debug.xegfxaccel_svdiag=N logs the next N surface dirty marks and page-offs (surface, result, path); 0 = off
+ static int gSVDiag;
+ SYSCTL_INT(_debug, OID_AUTO, nvaccel_svdiag, CTLFLAG_RW | CTLFLAG_LOCKED, &gSVDiag, 0, "log the next N surface dirty marks and page-offs");
+ static bool nvSVDiag() { return gSVDiag > 0 && OSDecrementAtomic(&gSVDiag) > 0; }
+@@ -2007,7 +2111,7 @@
+                                                      (unsigned)rr, e->f.flipResult, head); }
+         if (++gIopAsyncRefuseRun >= 3 && gIopAsync) {
+             gIopAsync = 0;
+-            ALOG("iop: b89k 3 async refusals in a row -- debug.nvaccel_iop_async=0 (synchronous flip, which copies on refusal)");
++            ALOG("iop: b89k 3 async refusals in a row -- debug.xegfxaccel_iop_async=0 (synchronous flip, which copies on refusal)");
+         }
+         ((OSObject *)s)->release();
+     }
+@@ -2454,6 +2558,24 @@
+ SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_scanout_sum_us, CTLFLAG_RD | CTLFLAG_LOCKED, &gScanoutSumUs, "all scanout copies, us");
+ SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_scanout_self, CTLFLAG_RD | CTLFLAG_LOCKED, &gCntScanoutSelf,
+             "swaps whose source was the scanout itself (copy skipped)");
++// the display-pipe copy path (performTransaction): copy/transaction/gap times in us, and the copy implementation switch
++SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_iop_copy_last_us, CTLFLAG_RD | CTLFLAG_LOCKED, &gIopCopyLastUs, "last display-pipe copy, us");
++SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_iop_copy_max_us, CTLFLAG_RD | CTLFLAG_LOCKED, &gIopCopyMaxUs, "slowest display-pipe copy, us");
++SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_iop_copy_sum_us, CTLFLAG_RD | CTLFLAG_LOCKED, &gIopCopySumUs, "all display-pipe copies, us");
++SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_iop_txn_last_us, CTLFLAG_RD | CTLFLAG_LOCKED, &gIopTxnLastUs, "last display-pipe transaction, us");
++SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_iop_txn_max_us, CTLFLAG_RD | CTLFLAG_LOCKED, &gIopTxnMaxUs, "slowest display-pipe transaction, us");
++SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_iop_txn_sum_us, CTLFLAG_RD | CTLFLAG_LOCKED, &gIopTxnSumUs, "all display-pipe transactions, us");
++SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_iop_gap_last_us, CTLFLAG_RD | CTLFLAG_LOCKED, &gIopGapLastUs, "gap since the previous display-pipe transaction, us");
++SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_iop_gap_max_us, CTLFLAG_RD | CTLFLAG_LOCKED, &gIopGapMaxUs, "longest gap between display-pipe transactions, us");
++SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_iop_gap_sum_us, CTLFLAG_RD | CTLFLAG_LOCKED, &gIopGapSumUs, "all gaps between display-pipe transactions, us");
++SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_memcpy, CTLFLAG_RW | CTLFLAG_LOCKED, &gIopMemcpy, 0,
++           "1 = copy the frame with memcpy (default), 0 = the word-by-word loop");
++SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_vblank, CTLFLAG_RW | CTLFLAG_LOCKED, &gIopVblank, 0,
++           "1 = copy each frame right after the panel's vblank (default), 0 = copy as soon as the transaction arrives");
++SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_iop_vblank_waits, CTLFLAG_RD | CTLFLAG_LOCKED, &gCntIopVblankWaits, "frames copied after a vblank wait");
++SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_iop_vblank_skips, CTLFLAG_RD | CTLFLAG_LOCKED, &gCntIopVblankSkips, "frames copied without a vblank wait (no MMIO, gate off, or timeout)");
++SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_iop_vblank_last_us, CTLFLAG_RD | CTLFLAG_LOCKED, &gIopVblankLastUs, "wait for the last vblank, us");
++SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_iop_vblank_max_us, CTLFLAG_RD | CTLFLAG_LOCKED, &gIopVblankMaxUs, "longest vblank wait, us");
+ // how far CoreDisplay gets with the display pipe (thanhnndev: it submits transactions only after AGDC 0x2001 is accepted)
+ SInt64 gCntPipeInit, gCntPipeValidate, gCntPipeComplete, gCntPipePerform;
+ SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_pipe_init, CTLFLAG_RD | CTLFLAG_LOCKED, &gCntPipeInit, "NVDisplayPipe::initFramebufferResource calls");
+--- /dev/null
++++ b/kexts/NVRM/accel/xegfx_accel_names.h
+@@ -0,0 +1,170 @@
++/* Intel/NVIDIA coexistence: generated from the upstream xe sysctl names. */
++#ifndef XEGFX_ACCEL_NAMES_H
++#define XEGFX_ACCEL_NAMES_H
++#ifdef NMX_XEGFX
++#define nvaccel_crc xegfxaccel_crc
++#define sysctl__debug_nvaccel_crc sysctl__debug_xegfxaccel_crc
++#define nvaccel_crc_head xegfxaccel_crc_head
++#define sysctl__debug_nvaccel_crc_head sysctl__debug_xegfxaccel_crc_head
++#define nvaccel_headless xegfxaccel_headless
++#define sysctl__debug_nvaccel_headless sysctl__debug_xegfxaccel_headless
++#define nvaccel_heads_piped xegfxaccel_heads_piped
++#define sysctl__debug_nvaccel_heads_piped sysctl__debug_xegfxaccel_heads_piped
++#define nvaccel_heads_published xegfxaccel_heads_published
++#define sysctl__debug_nvaccel_heads_published sysctl__debug_xegfxaccel_heads_published
++#define nvaccel_heads_registered xegfxaccel_heads_registered
++#define sysctl__debug_nvaccel_heads_registered sysctl__debug_xegfxaccel_heads_registered
++#define nvaccel_igpu xegfxaccel_igpu
++#define sysctl__debug_nvaccel_igpu sysctl__debug_xegfxaccel_igpu
++#define nvaccel_iop xegfxaccel_iop
++#define sysctl__debug_nvaccel_iop sysctl__debug_xegfxaccel_iop
++#define nvaccel_iop_async xegfxaccel_iop_async
++#define sysctl__debug_nvaccel_iop_async sysctl__debug_xegfxaccel_iop_async
++#define nvaccel_iop_async_drop xegfxaccel_iop_async_drop
++#define sysctl__debug_nvaccel_iop_async_drop sysctl__debug_xegfxaccel_iop_async_drop
++#define nvaccel_iop_async_flips xegfxaccel_iop_async_flips
++#define sysctl__debug_nvaccel_iop_async_flips sysctl__debug_xegfxaccel_iop_async_flips
++#define nvaccel_iop_async_refused xegfxaccel_iop_async_refused
++#define sysctl__debug_nvaccel_iop_async_refused sysctl__debug_xegfxaccel_iop_async_refused
++#define nvaccel_iop_blank xegfxaccel_iop_blank
++#define sysctl__debug_nvaccel_iop_blank sysctl__debug_xegfxaccel_iop_blank
++#define nvaccel_iop_copy_skip xegfxaccel_iop_copy_skip
++#define sysctl__debug_nvaccel_iop_copy_skip sysctl__debug_xegfxaccel_iop_copy_skip
++#define nvaccel_iop_copy_unwritten xegfxaccel_iop_copy_unwritten
++#define sysctl__debug_nvaccel_iop_copy_unwritten sysctl__debug_xegfxaccel_iop_copy_unwritten
++#define nvaccel_iop_empty xegfxaccel_iop_empty
++#define sysctl__debug_nvaccel_iop_empty sysctl__debug_xegfxaccel_iop_empty
++#define nvaccel_iop_fail xegfxaccel_iop_fail
++#define sysctl__debug_nvaccel_iop_fail sysctl__debug_xegfxaccel_iop_fail
++#define nvaccel_iop_flip xegfxaccel_iop_flip
++#define sysctl__debug_nvaccel_iop_flip sysctl__debug_xegfxaccel_iop_flip
++#define nvaccel_iop_flip_hit xegfxaccel_iop_flip_hit
++#define sysctl__debug_nvaccel_iop_flip_hit sysctl__debug_xegfxaccel_iop_flip_hit
++#define nvaccel_iop_flip_home xegfxaccel_iop_flip_home
++#define sysctl__debug_nvaccel_iop_flip_home sysctl__debug_xegfxaccel_iop_flip_home
++#define nvaccel_iop_flip_lock xegfxaccel_iop_flip_lock
++#define sysctl__debug_nvaccel_iop_flip_lock sysctl__debug_xegfxaccel_iop_flip_lock
++#define nvaccel_iop_flip_miss xegfxaccel_iop_flip_miss
++#define sysctl__debug_nvaccel_iop_flip_miss sysctl__debug_xegfxaccel_iop_flip_miss
++#define nvaccel_iop_flip_novram xegfxaccel_iop_flip_novram
++#define sysctl__debug_nvaccel_iop_flip_novram sysctl__debug_xegfxaccel_iop_flip_novram
++#define nvaccel_iop_flip_refused xegfxaccel_iop_flip_refused
++#define sysctl__debug_nvaccel_iop_flip_refused sysctl__debug_xegfxaccel_iop_flip_refused
++#define nvaccel_iop_flip_stale xegfxaccel_iop_flip_stale
++#define sysctl__debug_nvaccel_iop_flip_stale sysctl__debug_xegfxaccel_iop_flip_stale
++#define nvaccel_iop_flip_unwritten xegfxaccel_iop_flip_unwritten
++#define sysctl__debug_nvaccel_iop_flip_unwritten sysctl__debug_xegfxaccel_iop_flip_unwritten
++#define nvaccel_iop_flips xegfxaccel_iop_flips
++#define sysctl__debug_nvaccel_iop_flips sysctl__debug_xegfxaccel_iop_flips
++#define nvaccel_iop_late xegfxaccel_iop_late
++#define sysctl__debug_nvaccel_iop_late sysctl__debug_xegfxaccel_iop_late
++#define nvaccel_iop_ok xegfxaccel_iop_ok
++#define sysctl__debug_nvaccel_iop_ok sysctl__debug_xegfxaccel_iop_ok
++#define nvaccel_iop_ok_h0 xegfxaccel_iop_ok_h0
++#define sysctl__debug_nvaccel_iop_ok_h0 sysctl__debug_xegfxaccel_iop_ok_h0
++#define nvaccel_iop_ok_h1 xegfxaccel_iop_ok_h1
++#define sysctl__debug_nvaccel_iop_ok_h1 sysctl__debug_xegfxaccel_iop_ok_h1
++#define nvaccel_iop_ok_h2 xegfxaccel_iop_ok_h2
++#define sysctl__debug_nvaccel_iop_ok_h2 sysctl__debug_xegfxaccel_iop_ok_h2
++#define nvaccel_iop_ok_h3 xegfxaccel_iop_ok_h3
++#define sysctl__debug_nvaccel_iop_ok_h3 sysctl__debug_xegfxaccel_iop_ok_h3
++#define nvaccel_iop_ok_h4 xegfxaccel_iop_ok_h4
++#define sysctl__debug_nvaccel_iop_ok_h4 sysctl__debug_xegfxaccel_iop_ok_h4
++#define nvaccel_iop_src_res xegfxaccel_iop_src_res
++#define sysctl__debug_nvaccel_iop_src_res sysctl__debug_xegfxaccel_iop_src_res
++#define nvaccel_iop_src_surf xegfxaccel_iop_src_surf
++#define sysctl__debug_nvaccel_iop_src_surf sysctl__debug_xegfxaccel_iop_src_surf
++#define nvaccel_map_commit xegfxaccel_map_commit
++#define sysctl__debug_nvaccel_map_commit sysctl__debug_xegfxaccel_map_commit
++#define nvaccel_map_free xegfxaccel_map_free
++#define sysctl__debug_nvaccel_map_free sysctl__debug_xegfxaccel_map_free
++#define nvaccel_map_release xegfxaccel_map_release
++#define sysctl__debug_nvaccel_map_release sysctl__debug_xegfxaccel_map_release
++#define nvaccel_pipe_complete xegfxaccel_pipe_complete
++#define sysctl__debug_nvaccel_pipe_complete sysctl__debug_xegfxaccel_pipe_complete
++#define nvaccel_pipe_init xegfxaccel_pipe_init
++#define sysctl__debug_nvaccel_pipe_init sysctl__debug_xegfxaccel_pipe_init
++#define nvaccel_pipe_perform xegfxaccel_pipe_perform
++#define sysctl__debug_nvaccel_pipe_perform sysctl__debug_xegfxaccel_pipe_perform
++#define nvaccel_pipe_validate xegfxaccel_pipe_validate
++#define sysctl__debug_nvaccel_pipe_validate sysctl__debug_xegfxaccel_pipe_validate
++#define nvaccel_res_free xegfxaccel_res_free
++#define sysctl__debug_nvaccel_res_free sysctl__debug_xegfxaccel_res_free
++#define nvaccel_res_new xegfxaccel_res_new
++#define sysctl__debug_nvaccel_res_new sysctl__debug_xegfxaccel_res_new
++#define nvaccel_scanout_copies xegfxaccel_scanout_copies
++#define sysctl__debug_nvaccel_scanout_copies sysctl__debug_xegfxaccel_scanout_copies
++#define nvaccel_scanout_last_us xegfxaccel_scanout_last_us
++#define sysctl__debug_nvaccel_scanout_last_us sysctl__debug_xegfxaccel_scanout_last_us
++#define nvaccel_scanout_max_us xegfxaccel_scanout_max_us
++#define sysctl__debug_nvaccel_scanout_max_us sysctl__debug_xegfxaccel_scanout_max_us
++#define nvaccel_scanout_self xegfxaccel_scanout_self
++#define sysctl__debug_nvaccel_scanout_self sysctl__debug_xegfxaccel_scanout_self
++#define nvaccel_scanout_sum_us xegfxaccel_scanout_sum_us
++#define sysctl__debug_nvaccel_scanout_sum_us sysctl__debug_xegfxaccel_scanout_sum_us
++#define nvaccel_surface_gpu xegfxaccel_surface_gpu
++#define sysctl__debug_nvaccel_surface_gpu sysctl__debug_xegfxaccel_surface_gpu
++#define nvaccel_surface_gpu_marks xegfxaccel_surface_gpu_marks
++#define sysctl__debug_nvaccel_surface_gpu_marks sysctl__debug_xegfxaccel_surface_gpu_marks
++#define nvaccel_surface_gpu_on xegfxaccel_surface_gpu_on
++#define sysctl__debug_nvaccel_surface_gpu_on sysctl__debug_xegfxaccel_surface_gpu_on
++#define nvaccel_surface_gpu_timeouts xegfxaccel_surface_gpu_timeouts
++#define sysctl__debug_nvaccel_surface_gpu_timeouts sysctl__debug_xegfxaccel_surface_gpu_timeouts
++#define nvaccel_surface_gpu_wait_max_us xegfxaccel_surface_gpu_wait_max_us
++#define sysctl__debug_nvaccel_surface_gpu_wait_max_us sysctl__debug_xegfxaccel_surface_gpu_wait_max_us
++#define nvaccel_surface_gpu_waits xegfxaccel_surface_gpu_waits
++#define sysctl__debug_nvaccel_surface_gpu_waits sysctl__debug_xegfxaccel_surface_gpu_waits
++#define nvaccel_svdiag xegfxaccel_svdiag
++#define sysctl__debug_nvaccel_svdiag sysctl__debug_xegfxaccel_svdiag
++#define nvaccel_vm_alloc xegfxaccel_vm_alloc
++#define sysctl__debug_nvaccel_vm_alloc sysctl__debug_xegfxaccel_vm_alloc
++#define nvaccel_vm_alloc_bytes xegfxaccel_vm_alloc_bytes
++#define sysctl__debug_nvaccel_vm_alloc_bytes sysctl__debug_xegfxaccel_vm_alloc_bytes
++#define nvaccel_vm_dealloc xegfxaccel_vm_dealloc
++#define sysctl__debug_nvaccel_vm_dealloc sysctl__debug_xegfxaccel_vm_dealloc
++#define nvaccel_vm_dealloc_bytes xegfxaccel_vm_dealloc_bytes
++#define sysctl__debug_nvaccel_vm_dealloc_bytes sysctl__debug_xegfxaccel_vm_dealloc_bytes
++#define nvaccel_vm_park_released xegfxaccel_vm_park_released
++#define sysctl__debug_nvaccel_vm_park_released sysctl__debug_xegfxaccel_vm_park_released
++#define nvaccel_vm_parked xegfxaccel_vm_parked
++#define sysctl__debug_nvaccel_vm_parked sysctl__debug_xegfxaccel_vm_parked
++#define nvaccel_vm_refused xegfxaccel_vm_refused
++#define sysctl__debug_nvaccel_vm_refused sysctl__debug_xegfxaccel_vm_refused
++#define nvaccel_vm_sticky xegfxaccel_vm_sticky
++#define sysctl__debug_nvaccel_vm_sticky sysctl__debug_xegfxaccel_vm_sticky
++#define nvaccel_vm_unparked xegfxaccel_vm_unparked
++#define sysctl__debug_nvaccel_vm_unparked sysctl__debug_xegfxaccel_vm_unparked
++#define nvaccelfb xegfxaccelfb
++#define sysctl__debug_nvaccelfb sysctl__debug_xegfxaccelfb
++#define nvaccel_iop_copy_last_us xegfxaccel_iop_copy_last_us
++#define sysctl__debug_nvaccel_iop_copy_last_us sysctl__debug_xegfxaccel_iop_copy_last_us
++#define nvaccel_iop_copy_max_us xegfxaccel_iop_copy_max_us
++#define sysctl__debug_nvaccel_iop_copy_max_us sysctl__debug_xegfxaccel_iop_copy_max_us
++#define nvaccel_iop_copy_sum_us xegfxaccel_iop_copy_sum_us
++#define sysctl__debug_nvaccel_iop_copy_sum_us sysctl__debug_xegfxaccel_iop_copy_sum_us
++#define nvaccel_iop_txn_last_us xegfxaccel_iop_txn_last_us
++#define sysctl__debug_nvaccel_iop_txn_last_us sysctl__debug_xegfxaccel_iop_txn_last_us
++#define nvaccel_iop_txn_max_us xegfxaccel_iop_txn_max_us
++#define sysctl__debug_nvaccel_iop_txn_max_us sysctl__debug_xegfxaccel_iop_txn_max_us
++#define nvaccel_iop_txn_sum_us xegfxaccel_iop_txn_sum_us
++#define sysctl__debug_nvaccel_iop_txn_sum_us sysctl__debug_xegfxaccel_iop_txn_sum_us
++#define nvaccel_iop_gap_last_us xegfxaccel_iop_gap_last_us
++#define sysctl__debug_nvaccel_iop_gap_last_us sysctl__debug_xegfxaccel_iop_gap_last_us
++#define nvaccel_iop_gap_max_us xegfxaccel_iop_gap_max_us
++#define sysctl__debug_nvaccel_iop_gap_max_us sysctl__debug_xegfxaccel_iop_gap_max_us
++#define nvaccel_iop_gap_sum_us xegfxaccel_iop_gap_sum_us
++#define sysctl__debug_nvaccel_iop_gap_sum_us sysctl__debug_xegfxaccel_iop_gap_sum_us
++#define nvaccel_iop_vblank xegfxaccel_iop_vblank
++#define sysctl__debug_nvaccel_iop_vblank sysctl__debug_xegfxaccel_iop_vblank
++#define nvaccel_iop_vblank_waits xegfxaccel_iop_vblank_waits
++#define sysctl__debug_nvaccel_iop_vblank_waits sysctl__debug_xegfxaccel_iop_vblank_waits
++#define nvaccel_iop_vblank_skips xegfxaccel_iop_vblank_skips
++#define sysctl__debug_nvaccel_iop_vblank_skips sysctl__debug_xegfxaccel_iop_vblank_skips
++#define nvaccel_iop_vblank_last_us xegfxaccel_iop_vblank_last_us
++#define sysctl__debug_nvaccel_iop_vblank_last_us sysctl__debug_xegfxaccel_iop_vblank_last_us
++#define nvaccel_iop_vblank_max_us xegfxaccel_iop_vblank_max_us
++#define sysctl__debug_nvaccel_iop_vblank_max_us sysctl__debug_xegfxaccel_iop_vblank_max_us
++#define nvaccel_iop_memcpy xegfxaccel_iop_memcpy
++#define sysctl__debug_nvaccel_iop_memcpy sysctl__debug_xegfxaccel_iop_memcpy
++#endif
++#endif
