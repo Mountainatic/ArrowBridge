@@ -1,0 +1,450 @@
+# 0004 NVRMAGDC: answer the K5 link-config command from the live panel timing
+#
+# Base:  NvGfx xe 5a19a73f36249efb99c44c3f9cb34603ef0c0eb8 (XeGfx 0.0.44)
+# Files: kexts/NVRMAGDC/nvrm-agdc.cpp (modified)
+#        kexts/NVRMAGDC/xe/Info.plist (modified: measured EDID, IOPCIFamily/IOGraphicsFamily libs)
+#        kexts/NVRMAGDC/xe/firmware-timing.h (new)
+#        kexts/NVRMAGDC/xe/panel-timing.h (new)
+# Apply: patch -p1 < patches/0004-agdc-k5-panel-timing.patch
+#
+# IOPresentment only starts display-pipe transactions after AGDC answers the K5 link-config
+# command (0x921) with the panel's timing.  The kext now probes the display engine on BAR0
+# read-only (same 14 registers and frame counter as XeGfxIntelFB), validates a cached panel
+# EDID against those live registers and the measured frame counter, and answers K5 from the
+# result.  debug.xegfx_panel_probe captures one read-only Pipe A snapshot, and
+# debug.xegfx_panel_timing_source / debug.xegfx_panel_probe_result report what was accepted.
+# Without an exact match the kext declines the Intel display trial instead of guessing.
+#
+
+--- a/kexts/NVRMAGDC/nvrm-agdc.cpp
++++ b/kexts/NVRMAGDC/nvrm-agdc.cpp
+@@ -68,6 +68,71 @@
+ extern "C" kern_return_t _stop(kmod_info_t *ki, void *d)  { return KERN_SUCCESS; }
+ #include "AppleGraphicsDeviceControl_re.h"
+ #include "nvrm-agdc-k5.h"
++#ifdef NMX_XEGFX
++#include <IOKit/graphics/IOFramebuffer.h>
++#include <IOKit/pci/IOPCIDevice.h>
++#include "xe/firmware-timing.h"
++static uint32_t gXePanelTiming[NVK5_TIMING_WORDS];
++static bool gXePanelTimingValid = false;
++static XeGfxFirmwareTiming gXeFirmwareTiming = {};
++static uint8_t gXePanelEDID[512];
++static unsigned gXePanelEDIDBytes = 0;
++static char gXePanelTimingSource[64] = "not validated";
++static int gXeTimingProbeState = 0;
++static char gXeTimingProbe[512] = "not probed";
++// A single BAR0 read-only snapshot. Never map BAR2 or read stolen framebuffer memory.
++// Register offsets and sync polarity follow the pinned i915_reg.h, display 14.
++static bool xeProbePanelTiming(IOService *service)
++{
++    IOPCIDevice *pci = service ? OSDynamicCast(IOPCIDevice, service->getProvider()) : nullptr;
++    if (!pci || pci->configRead16(0) != 0x8086 || pci->configRead16(2) != 0x7d67 ||
++        !(pci->configRead16(4) & 2)) return false;
++    IOMemoryDescriptor *bar = pci->getDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0);
++    IOMemoryMap *map = bar ? bar->map(kIOMapInhibitCache) : nullptr;
++    if (!map) return false;
++    bool ok = false;
++    if (map->getLength() >= 0x71000) {
++        volatile uint32_t *r = (volatile uint32_t *)map->getVirtualAddress();
++        const uint32_t conf = r[0x70008/4], plane = r[0x70180/4], size = r[0x70190/4];
++        const uint32_t ht = r[0x60000/4], hs = r[0x60008/4], vt = r[0x6000c/4], vs = r[0x60014/4];
++        const uint32_t ddi = r[0x60400/4], surf = r[0x7019c/4];
++        uint64_t before, after, elapsed;
++        clock_get_uptime(&before); const uint32_t a = r[0x70040/4];
++        IOSleep(500);
++        const uint32_t b = r[0x70040/4]; clock_get_uptime(&after);
++        absolutetime_to_nanoseconds(after - before, &elapsed);
++        const uint32_t frames = b-a;
++        snprintf(gXeTimingProbe, sizeof gXeTimingProbe,
++                 "pipe=A conf=%#x plane=%#x size=%#x surf=%#x ht=%#x hs=%#x vt=%#x vs=%#x ddi=%#x frames=%u ns=%llu",
++                 conf, plane, size, surf, ht, hs, vt, vs, ddi, frames, elapsed);
++        const XeGfxFirmwareTiming snapshot = {conf, plane, size, ht, hs, vt, vs, ddi, frames, elapsed};
++        XeGfxPanelMode measuredMode = {}; uint32_t measured[NVK5_TIMING_WORDS];
++        ok = xeFirmwareMode(snapshot, measuredMode) && xegfxPanelTiming(measuredMode, measured);
++        if (ok) {
++            gXeFirmwareTiming = snapshot;
++            service->setProperty("XeGfxMeasuredPanelTiming", measured, sizeof measured);
++            uint32_t exact[NVK5_TIMING_WORDS];
++            if (xeFirmwareEDIDTiming(snapshot, gXePanelEDID, gXePanelEDIDBytes, exact))
++                service->setProperty("XeGfxMatchedEDIDPanelTiming", exact, sizeof exact);
++            else service->removeProperty("XeGfxMatchedEDIDPanelTiming");
++        }
++        if (conf != r[0x70008/4] || plane != r[0x70180/4] || size != r[0x70190/4] ||
++            surf != r[0x7019c/4] || ht != r[0x60000/4] || vt != r[0x6000c/4]) ok = false;
++        if (!ok) { service->removeProperty("XeGfxMeasuredPanelTiming"); service->removeProperty("XeGfxMatchedEDIDPanelTiming"); }
++    }
++    map->release(); return ok;
++}
++static bool xeReadPanelTiming(IOService *service)
++{
++    // The firmware framebuffer reports IOFB0Hz and no detailed timing on this
++    // machine. Read the active registers once; a cached EDID is permitted only
++    // by the exact geometry/polarity and live frame-counter checks in the helper.
++    if (!xeProbePanelTiming(service)) return false;
++    if (!xeFirmwareEDIDTiming(gXeFirmwareTiming, gXePanelEDID, gXePanelEDIDBytes, gXePanelTiming)) return false;
++    strlcpy(gXePanelTimingSource, "cached-panel-EDID matched to live registers/counter", sizeof gXePanelTimingSource);
++    return true;
++}
++#endif
+ #pragma pack(push, 1)
+ struct NVAGDCVendorInfo {
+     uint32_t version;
+@@ -137,12 +202,8 @@
+         if (d) { have = true; tBytes = d->getLength(); bzero(t[i], sizeof t[i]); if (tBytes == sizeof t[i]) memcpy(t[i], d->getBytesNoCopy(), sizeof t[i]); }
+         OSSafeReleaseNULL(o);
+ #ifdef NMX_XEGFX
+-        // Apple's boot framebuffer has no timing record: the built-in panel's native mode, as NVRMFB publishes it for
+-        // the same panel in Discrete (N-182 NVRMTiming), which the firmware also sets on the iGPU
+-        if (!have) {
+-            static const uint32_t panel[NVK5_TIMING_WORDS] = { NVK5_TIMING_TAG, 782710000u, 2560, 2640, 2672, 2720,
+-                                                               1600, 1670, 1678, 1744, 165000, 0, 1 };
+-            memcpy(t[i], panel, sizeof panel); have = true; tBytes = sizeof panel;
++        if (!have && gXePanelTimingValid) {
++            memcpy(t[i], gXePanelTiming, sizeof gXePanelTiming); have = true; tBytes = sizeof gXePanelTiming;
+         }
+ #endif
+         h[i].t = have ? t[i] : NULL; h[i].tBytes = tBytes;
+@@ -244,7 +305,9 @@
+     if (!p || !p->metaCast("IOPCIDevice")) { f->release(); return; }
+ #ifdef NMX_XEGFX
+     { OSData *v = OSDynamicCast(OSData, p->getProperty("vendor-id"));
+-      if (!v || v->getLength() < 2 || *(const uint16_t *)v->getBytesNoCopy() != AGDC_VENDOR_ID) { f->release(); return; } }
++      OSData *d = OSDynamicCast(OSData, p->getProperty("device-id"));
++      if (!v || v->getLength() < 2 || *(const uint16_t *)v->getBytesNoCopy() != AGDC_VENDOR_ID ||
++          !d || d->getLength() < 2 || *(const uint16_t *)d->getBytesNoCopy() != 0x7d67) { f->release(); return; } }
+ #endif
+     gAgdcFBRef = f; *fb = f; *pci = p;
+ }
+@@ -268,6 +331,11 @@
+         if (p != pci) { other++; SCANLOG("framebuffer id %#llx is under another PCI device: not ours to report", rid); continue; }
+         OSObject *io = f->copyProperty("IOFBDependentIndex"); OSNumber *num = OSDynamicCast(OSNumber, io);
+         long long ix = num ? (long long)num->unsigned32BitValue() : -1; OSSafeReleaseNULL(io);
++#ifdef NMX_XEGFX
++        // The sole firmware framebuffer has no dependent index. Its AGDC slot is 0;
++        // accelerator head 4 is an internal implementation detail, not an AGDC index.
++        if (ix < 0 && f == gAgdcFBRef) ix = 0;
++#endif
+         if (ix < 0) { noidx++; SCANLOG("framebuffer id %#llx has no IOFBDependentIndex number: left out", rid); continue; }
+         if (ix >= kAgdcMaxFB) { range++; SCANLOG("framebuffer id %#llx IOFBDependentIndex %lld >= %d: left out", rid, ix, (int)kAgdcMaxFB); continue; }
+         if (tab[ix]) { dup++; SCANLOG("IOFBDependentIndex %lld claimed twice: id %#llx kept, id %#llx left out", ix, (unsigned long long)tab[ix]->getRegistryEntryID(), rid); continue; }
+@@ -293,13 +361,32 @@
+ static void nvdaAgdcWorkBody(void);
+ static void nvdaAgdcWork(thread_call_param_t, thread_call_param_t)
+ {
+-    OSIncrementAtomic(&gAgdcBusy); nvdaAgdcWorkBody(); OSDecrementAtomic(&gAgdcBusy);
++#ifndef NMX_XEGFX
++    OSIncrementAtomic(&gAgdcBusy);
++#endif
++    nvdaAgdcWorkBody(); OSDecrementAtomic(&gAgdcBusy);
+ }
+ static void nvdaAgdcWorkBody(void)
+ {
++#ifdef NMX_XEGFX
++    if (gAgdcWant == 3 && !gAgdc) {
++        IOService *pci = nullptr, *fb = nullptr; nvdaAgdcTargets(&pci, &fb);
++        gXeTimingProbeState = (pci && fb && xeProbePanelTiming(fb)) ? 1 : -1;
++        nvdaAgdcDropFB(); return;
++    }
++#endif
+     if (gAgdcWant == 1 && !gAgdc) {
+         IOService *pci = nullptr, *fb = nullptr; nvdaAgdcTargets(&pci, &fb);
+         if (!pci || !fb) { gAgdcState = -1; FBLOG("AGDC: no PCI device or no framebuffer yet (pci %p fb %p)", pci, fb); return; }
++#ifdef NMX_XEGFX
++        gXePanelTimingValid = xeReadPanelTiming(fb);
++        if (!gXePanelTimingValid) {
++            gAgdcState = -6; FBLOG("AGDC: no exact cached-panel EDID timing matches live registers/counter; declining Intel display trial");
++            nvdaAgdcDropFB(); return;
++        }
++        FBLOG("AGDC: live firmware timing %ux%u, %u mHz, pixel clock %u", gXePanelTiming[NVK5_T_HVIS],
++              gXePanelTiming[NVK5_T_VVIS], gXePanelTiming[NVK5_T_REFRESH_MHZ], gXePanelTiming[NVK5_T_PCLK]);
++#endif
+         nvdaAgdcScan(pci);
+         NVDADeviceControl *d = OSTypeAlloc(NVDADeviceControl);
+         if (!d) { gAgdcState = -2; FBLOG("AGDC: alloc failed"); nvdaAgdcDropFB(); return; }
+@@ -308,6 +395,9 @@
+         if (!d->attach(pci)) { gAgdcState = -4; FBLOG("AGDC: attach(%s) failed", pci->getName()); d->release(); nvdaAgdcDropFB(); return; }
+         if (!d->start(pci)) { gAgdcState = -5; FBLOG("AGDC: AppleGraphicsDeviceControl::start failed (vendor calls so far %lld)", gAgdcCmds); d->detach(pci); d->release(); nvdaAgdcDropFB(); return; }
+         gAgdc = d; gAgdcState = 1;
++#ifdef NMX_XEGFX
++        pci->setProperty("XeGfxAGDCReady", kOSBooleanTrue);
++#endif
+         FBLOG("AGDC: UP on %s — %u framebuffer slot(s), maxFramebuffers %d; vendor calls %lld, refused %lld (last %#x)", pci->getName(), gAgdcNFB, gAgdcMaxFBOut, gAgdcCmds, gAgdcUnsupported, gAgdcLastRefused);
+     } else if (gAgdcWant == 0 && gAgdc) {
+         NVDADeviceControl *d = gAgdc; gAgdc = nullptr;
+@@ -323,14 +413,38 @@
+ #ifdef NMX_XEGFX
+     // a terminated client on the live iGPU is the FLR risk the XeGfx notes warn about: up only, a reboot takes it down
+     if (v == 0) return EPERM;
++    if (!OSCompareAndSwap(0, 1, (volatile UInt32 *)&gAgdcBusy)) return EBUSY;
+ #endif
+     gAgdcWant = v;
+     if (!gAgdcCall) gAgdcCall = thread_call_allocate(nvdaAgdcWork, nullptr);
+-    if (!gAgdcCall) return ENOMEM;
++    if (!gAgdcCall) {
++#ifdef NMX_XEGFX
++        OSDecrementAtomic(&gAgdcBusy);
++#endif
++        return ENOMEM;
++    }
+     thread_call_enter(gAgdcCall); return 0;
+ }
+ SYSCTL_PROC(_debug, OID_AUTO, nvrmfb_agdc, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, NULL, 0, nvrmfb_agdc_sysctl, "I",
+             "write 1 = create our AppleGraphicsDeviceControl object, 0 = terminate it; reads the state (1 UP, <0 failed step)");
++#ifdef NMX_XEGFX
++static int xeTimingProbeSysctl SYSCTL_HANDLER_ARGS
++{
++    int v = gXeTimingProbeState; int err = sysctl_handle_int(oidp, &v, 0, req);
++    if (err || !req->newptr) return err;
++    if (v != 1 || gAgdc) return EBUSY;
++    if (!OSCompareAndSwap(0, 1, (volatile UInt32 *)&gAgdcBusy)) return EBUSY;
++    if (!gAgdcCall) gAgdcCall = thread_call_allocate(nvdaAgdcWork, nullptr);
++    if (!gAgdcCall) { OSDecrementAtomic(&gAgdcBusy); return ENOMEM; }
++    gXeTimingProbeState = 0; gAgdcWant = 3; thread_call_enter(gAgdcCall); return 0;
++}
++SYSCTL_PROC(_debug, OID_AUTO, xegfx_panel_probe, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN,
++            NULL, 0, xeTimingProbeSysctl, "I", "1: read-only Pipe A timing snapshot; does not create AGDC");
++SYSCTL_STRING(_debug, OID_AUTO, xegfx_panel_timing_source, CTLFLAG_RD | CTLFLAG_LOCKED,
++              gXePanelTimingSource, sizeof gXePanelTimingSource, "Exact nominal clock source; not a PLL readout");
++SYSCTL_STRING(_debug, OID_AUTO, xegfx_panel_probe_result, CTLFLAG_RD | CTLFLAG_LOCKED,
++              gXeTimingProbe, sizeof gXeTimingProbe, "Raw firmware timing; measured clock is diagnostic only");
++#endif
+ SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_agdc_cmds,    CTLFLAG_RD | CTLFLAG_LOCKED, &gAgdcCmds,        "AGDC vendor calls received");
+ SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_agdc_refused, CTLFLAG_RD | CTLFLAG_LOCKED, &gAgdcUnsupported, "AGDC vendor calls answered Unsupported");
+ SYSCTL_INT (_debug, OID_AUTO, nvrmfb_agdc_last_refused, CTLFLAG_RD | CTLFLAG_LOCKED, &gAgdcLastRefused, 0, "last AGDC command refused");
+@@ -349,6 +463,11 @@
+ SYSCTL_INT (_debug, OID_AUTO, nvrmfb_agdc_k5_last_refused_idx, CTLFLAG_RD | CTLFLAG_LOCKED, &gAgdcK5LastRefusedIdx, 0, "the index the last BADARG/NOTFOUND refusal named (-1 none); an Unsupported 0x711 type shows in k5_asked only");
+ static void nvdaAgdcRemoveSysctl(void)
+ {
++#ifdef NMX_XEGFX
++    sysctl_unregister_oid(&sysctl__debug_xegfx_panel_timing_source);
++    sysctl_unregister_oid(&sysctl__debug_xegfx_panel_probe);
++    sysctl_unregister_oid(&sysctl__debug_xegfx_panel_probe_result);
++#endif
+     sysctl_unregister_oid(&sysctl__debug_nvrmfb_agdc); sysctl_unregister_oid(&sysctl__debug_nvrmfb_agdc_cmds);
+     sysctl_unregister_oid(&sysctl__debug_nvrmfb_agdc_refused); sysctl_unregister_oid(&sysctl__debug_nvrmfb_agdc_last_refused);
+     sysctl_unregister_oid(&sysctl__debug_nvrmfb_agdc_k5); sysctl_unregister_oid(&sysctl__debug_nvrmfb_agdc_k5_link);
+@@ -361,6 +480,11 @@
+ }
+ static void nvdaAgdcInstallSysctl(void)
+ {
++#ifdef NMX_XEGFX
++    sysctl_register_oid(&sysctl__debug_xegfx_panel_timing_source);
++    sysctl_register_oid(&sysctl__debug_xegfx_panel_probe);
++    sysctl_register_oid(&sysctl__debug_xegfx_panel_probe_result);
++#endif
+     sysctl_register_oid(&sysctl__debug_nvrmfb_agdc); sysctl_register_oid(&sysctl__debug_nvrmfb_agdc_cmds);
+     sysctl_register_oid(&sysctl__debug_nvrmfb_agdc_refused); sysctl_register_oid(&sysctl__debug_nvrmfb_agdc_last_refused);
+     sysctl_register_oid(&sysctl__debug_nvrmfb_agdc_k5); sysctl_register_oid(&sysctl__debug_nvrmfb_agdc_k5_link);
+@@ -385,6 +509,14 @@
+     { if (nvrm_driver_off()) return false; }
+ #endif
+     if (!IOService::start(provider)) return false;
++#ifdef NMX_XEGFX
++    if (OSData *edid = OSDynamicCast(OSData, getProperty("XeGfxPanelEDID"))) {
++        if (edid->getLength() <= sizeof gXePanelEDID) {
++            gXePanelEDIDBytes = edid->getLength();
++            memcpy(gXePanelEDID, edid->getBytesNoCopy(), gXePanelEDIDBytes);
++        }
++    }
++#endif
+     nvdaAgdcInstallSysctl(); FBLOG("loaded; idle until `sysctl debug.%s=1`", sysctl__debug_nvrmfb_agdc.oid_name); return true;
+ }
+ void NVDAGDCLoader::stop(IOService *provider)
+--- a/kexts/NVRMAGDC/xe/Info.plist
++++ b/kexts/NVRMAGDC/xe/Info.plist
+@@ -1,27 +1,66 @@
+ <?xml version="1.0" encoding="UTF-8"?>
+ <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+-<plist version="1.0"><dict>
+-  <key>CFBundleIdentifier</key><string>org.watchthelight.XeGfxAGDC</string>
+-  <key>CFBundleName</key><string>XeGfxAGDC</string>
+-  <key>CFBundleExecutable</key><string>XeGfxAGDC</string>
+-  <key>CFBundlePackageType</key><string>KEXT</string>
+-  <key>CFBundleVersion</key><string>0.1</string>
+-  <key>CFBundleShortVersionString</key><string>0.1</string>
+-  <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+-  <key>IOKitPersonalities</key><dict>
+-    <key>XeGfxAGDCLoader</key><dict>
+-      <key>CFBundleIdentifier</key><string>org.watchthelight.XeGfxAGDC</string>
+-      <key>IOClass</key><string>XeGfxAGDCLoader</string>
+-      <key>IOProviderClass</key><string>IOResources</string>
+-      <key>IOResourceMatch</key><string>IOKit</string>
+-      <key>IOMatchCategory</key><string>XeGfxAGDCLoader</string>
+-    </dict>
+-  </dict>
+-  <key>OSBundleLibraries</key><dict>
+-    <key>com.apple.kpi.iokit</key><string>8.0</string>
+-    <key>com.apple.kpi.libkern</key><string>8.0</string>
+-    <key>com.apple.kpi.mach</key><string>8.0</string>
+-    <key>com.apple.kpi.bsd</key><string>8.0</string>
+-    <key>com.apple.AppleGraphicsDeviceControl</key><string>1.0.0</string>
+-  </dict>
+-</dict></plist>
++<plist version="1.0">
++<dict>
++	<key>CFBundleIdentifier</key>
++	<string>org.watchthelight.XeGfxAGDC</string>
++	<key>CFBundleName</key>
++	<string>XeGfxAGDC</string>
++	<key>CFBundleExecutable</key>
++	<string>XeGfxAGDC</string>
++	<key>CFBundlePackageType</key>
++	<string>KEXT</string>
++	<key>CFBundleVersion</key>
++	<string>0.1</string>
++	<key>CFBundleShortVersionString</key>
++	<string>0.1</string>
++	<key>CFBundleInfoDictionaryVersion</key>
++	<string>6.0</string>
++	<key>IOKitPersonalities</key>
++	<dict>
++		<key>XeGfxAGDCLoader</key>
++		<dict>
++			<key>CFBundleIdentifier</key>
++			<string>org.watchthelight.XeGfxAGDC</string>
++			<key>IOClass</key>
++			<string>XeGfxAGDCLoader</string>
++			<key>IOProviderClass</key>
++			<string>IOResources</string>
++			<key>IOResourceMatch</key>
++			<string>IOKit</string>
++			<key>IOMatchCategory</key>
++			<string>XeGfxAGDCLoader</string>
++			<key>XeGfxPanelEDID</key>
++			<data>
++			AP///////wAJ5VUNAAAAACYiAQS1IhZ4B6X1pVRLoSYNUFQAAAAB
++			AQEBAQEBAQEBAQEBAQEBYGwAoKBAZGAwIGYAWdcQAAAaAAAAAAAA
++			AAAAAAAAAAAAAAAAAAAA/gBCT0UgTkoKICAgICAgAAAA/ABORTE2
++			MFFETS1OWkwKAuwCAyQA4wWAAOYGBQFqakh0GgAAA1E88AAAakhq
++			SCwBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
++			AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
++			AAAAAAAAAAAAAAAAAAAAAAAAAAAAwnAgeQIAIgAovyoVhf8JnwAv
++			AB8APwZjAAUABQD/7hCF/wmfAC8AHwA/BmMABQAFACsAEicAeCsB
++			ACcAZO8AACcAMDsAACEBHXcNaggACkAGiFZ6VLREoWrSDQI1VNBf
++			0F8AOBN4LgAGQE7QX9BfJQEJvyoVvyoVPCyBAAAAAMGQ
++			</data>
++		</dict>
++	</dict>
++	<key>OSBundleLibraries</key>
++	<dict>
++		<key>com.apple.iokit.IOPCIFamily</key>
++		<string>1.0.0</string>
++		<key>com.apple.iokit.IOGraphicsFamily</key>
++		<string>1.0.0</string>
++		<key>com.apple.kpi.iokit</key>
++		<string>8.0</string>
++		<key>com.apple.kpi.libkern</key>
++		<string>8.0</string>
++		<key>com.apple.kpi.mach</key>
++		<string>8.0</string>
++		<key>com.apple.kpi.bsd</key>
++		<string>8.0</string>
++		<key>com.apple.AppleGraphicsDeviceControl</key>
++		<string>1.0.0</string>
++	</dict>
++</dict>
++</plist>
+--- /dev/null
++++ b/kexts/NVRMAGDC/xe/firmware-timing.h
+@@ -0,0 +1,66 @@
++#ifndef XEGFX_FIRMWARE_TIMING_H
++#define XEGFX_FIRMWARE_TIMING_H
++#include "panel-timing.h"
++struct XeGfxFirmwareTiming {
++    uint32_t conf, plane, size, ht, hs, vt, vs, ddi, frames;
++    uint64_t elapsed;
++};
++// ICL+ format occupies bits 27:23. XRGB8888 is 8 in that field (4 << 24).
++// Definitions: pinned i915/display/skl_universal_plane_regs.h and i915_reg.h.
++static inline bool xeFirmwareMode(const XeGfxFirmwareTiming &s, XeGfxPanelMode &m)
++{
++    if ((s.conf & 0xc0000000) != 0xc0000000 || !(s.plane & 0x80000000) ||
++        ((s.plane >> 23) & 31) != 8 || (s.plane & (7u << 10)) ||
++        (s.plane & (1u << 20)) || s.frames < 10 || s.frames > 500 ||
++        s.elapsed < 400000000 || s.elapsed > 2000000000) return false;
++    const uint32_t w=(s.ht&65535)+1, h=(s.vt&65535)+1;
++    const uint32_t ht=(s.ht>>16)+1, vt=(s.vt>>16)+1;
++    const uint32_t hs=(s.hs&65535)+1, he=(s.hs>>16)+1;
++    const uint32_t vs=(s.vs&65535)+1, ve=(s.vs>>16)+1;
++    if (w!=(s.size&65535)+1 || h!=(s.size>>16)+1 || ht<=w || vt<=h ||
++        hs<w || he<=hs || he>ht || vs<h || ve<=vs || ve>vt) return false;
++    const uint64_t mhz=(uint64_t)s.frames*1000000000000ull/s.elapsed;
++    m={ (uint64_t)ht*vt*mhz/1000, w,ht-w,hs-w,he-hs,h,vt-h,vs-h,ve-vs,
++        s.ddi&(1u<<16),s.ddi&(1u<<17) };
++    uint32_t t[NVK5_TIMING_WORDS];return xegfxPanelTiming(m,t);
++}
++// Use a cached EDID's exact *nominal* clock only when every timing field and
++// polarity agrees with this boot's registers and its frame counter agrees too.
++// This is not a PLL readout or permission to program display registers.
++static inline bool xeFirmwareEDIDTiming(const XeGfxFirmwareTiming &s,
++                                        const uint8_t *edid, unsigned bytes, uint32_t *out)
++{
++    XeGfxPanelMode live={};
++    if (!out || !edid || !xeFirmwareMode(s,live) || bytes<128 || bytes>512 || bytes%128 ||
++        bytes!=128u*(1u+edid[126]) || edid[0] || edid[7] || edid[18]!=1) return false;
++    for (unsigned i=1;i<7;i++) if(edid[i]!=255) return false;
++    for (unsigned block=0;block<bytes;block+=128) {
++        unsigned sum=0;for(unsigned i=0;i<128;i++) sum+=edid[block+i];
++        if(sum&255) return false;
++    }
++    bool found=false;uint32_t selected[NVK5_TIMING_WORDS]={};
++    for(unsigned off=54;off+18<=126;off+=18) {
++        const uint8_t *d=edid+off;
++        if(!(d[0]|d[1]) || (d[17]&0x80) || (d[17]&0x18)!=0x18) continue;
++        XeGfxPanelMode m={ (uint64_t)(d[0]|(d[1]<<8))*10000,
++            (uint32_t)(d[2]|((d[4]&0xf0)<<4)), (uint32_t)(d[3]|((d[4]&15)<<8)),
++            (uint32_t)(d[8]|((d[11]&0xc0)<<2)), (uint32_t)(d[9]|((d[11]&0x30)<<4)),
++            (uint32_t)(d[5]|((d[7]&0xf0)<<4)), (uint32_t)(d[6]|((d[7]&15)<<8)),
++            (uint32_t)((d[10]>>4)|((d[11]&12)<<2)), (uint32_t)((d[10]&15)|((d[11]&3)<<4)),
++            (uint32_t)(d[17]&2), (uint32_t)(d[17]&4) };
++        if(m.width!=live.width || m.height!=live.height || m.hblank!=live.hblank || m.vblank!=live.vblank ||
++            m.hoffset!=live.hoffset || m.hpulse!=live.hpulse || m.voffset!=live.voffset || m.vpulse!=live.vpulse ||
++            !!m.hpositive!=!!live.hpositive || !!m.vpositive!=!!live.vpositive) continue;
++        uint32_t t[NVK5_TIMING_WORDS];if(!xegfxPanelTiming(m,t)) continue;
++        const uint64_t nominal=t[NVK5_T_REFRESH_MHZ];
++        const uint64_t measured=(uint64_t)s.frames*1000000000000ull/s.elapsed;
++        const uint64_t difference=nominal>measured?nominal-measured:measured-nominal;
++        if(difference*100>nominal*5) continue;
++        if(found) for(unsigned i=0;i<NVK5_TIMING_WORDS;i++) if(selected[i]!=t[i]) return false;
++        for(unsigned i=0;i<NVK5_TIMING_WORDS;i++) selected[i]=t[i];
++        found=true;
++    }
++    if(found) for(unsigned i=0;i<NVK5_TIMING_WORDS;i++) out[i]=selected[i];
++    return found;
++}
++#endif
+--- /dev/null
++++ b/kexts/NVRMAGDC/xe/panel-timing.h
+@@ -0,0 +1,31 @@
++#ifndef XEGFX_PANEL_TIMING_H
++#define XEGFX_PANEL_TIMING_H
++#include <stdint.h>
++#include "../nvrm-agdc-k5.h"
++
++struct XeGfxPanelMode {
++    uint64_t clock;
++    uint32_t width, hblank, hoffset, hpulse;
++    uint32_t height, vblank, voffset, vpulse;
++    uint32_t hpositive, vpositive;
++};
++
++static inline bool xegfxPanelTiming(const XeGfxPanelMode &m, uint32_t *out)
++{
++    if (!out || !m.clock || m.clock > UINT32_MAX || !m.width || !m.height) return false;
++    const uint64_t ht = (uint64_t)m.width + m.hblank, vt = (uint64_t)m.height + m.vblank;
++    const uint64_t hs = (uint64_t)m.width + m.hoffset, he = hs + m.hpulse;
++    const uint64_t vs = (uint64_t)m.height + m.voffset, ve = vs + m.vpulse;
++    if (ht > 65536 || vt > 65536 || !m.hpulse || !m.vpulse || he > ht || ve > vt) return false;
++    const uint64_t mhz = m.clock * 1000 / (ht * vt);
++    if (mhz < 1000 || mhz > 1000000) return false;
++    const uint32_t t[NVK5_TIMING_WORDS] = {
++        NVK5_TIMING_TAG, (uint32_t)m.clock, m.width, (uint32_t)hs, (uint32_t)he, (uint32_t)ht,
++        m.height, (uint32_t)vs, (uint32_t)ve, (uint32_t)vt, (uint32_t)mhz,
++        m.hpositive ? 1u : 0u, m.vpositive ? 1u : 0u
++    };
++    if (nvk5_timing_bad(t, sizeof t)) return false;
++    for (unsigned i = 0; i < NVK5_TIMING_WORDS; i++) out[i] = t[i];
++    return true;
++}
++#endif
