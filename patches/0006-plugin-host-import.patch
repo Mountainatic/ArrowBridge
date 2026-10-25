@@ -1,0 +1,59 @@
+# 0006 plugin: refuse a read-only host pointer before i915 pins it for writing
+#
+# Base:  this patch series, after 0005 (XeMTL plugin tree)
+# Files: plugin/nvmtl_vk.c (modified)
+# Apply: patch -p1 < patches/0006-plugin-host-import.patch
+#
+# A WindowServer buffer can be a read-only 16 MB host pointer.  i915 pins imported host pointers
+# for writing (FOLL_WRITE); on a read-only mapping that pin fails, the draw that references the
+# buffer returns EFAULT, and WindowServer's Vulkan device is lost.  The import path now walks the
+# VM regions behind the pointer, refuses the range unless every region is writable, and lets the
+# caller take the copy path instead.  This backports NvGfx upstream commit e60f462, which the
+# 0.0.35-based plugin tree did not have.
+#
+
+--- a/plugin/nvmtl_vk.c
++++ b/plugin/nvmtl_vk.c
+@@ -8,6 +8,8 @@
+ #include <mach-o/loader.h>
+ #include <mach-o/nlist.h>
+ #include <mach/mach.h>
++#include <mach/mach_vm.h>
++#include <mach/vm_region.h>
+ #include <unistd.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -1395,6 +1397,22 @@
+     return out;
+ }
+ 
++// i915 holds userptr pages for writing, so a read-only range (constant data, a mapped file) fails at the next submit
++// with EFAULT and ANV loses the device (N-284, WindowServer); such buffers are copied instead
++static int nvmtl_range_writable(const void *ptr, size_t size)
++{
++    mach_vm_address_t a = (mach_vm_address_t)(uintptr_t)ptr, end = a + size;
++    while (a < end) {
++        mach_vm_address_t ra = a; mach_vm_size_t rs = 0; vm_region_basic_info_data_64_t info;
++        mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64; mach_port_t obj = MACH_PORT_NULL;
++        if (mach_vm_region(mach_task_self(), &ra, &rs, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &cnt, &obj) != KERN_SUCCESS)
++            return 0;
++        if (obj != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), obj);
++        if (ra > a || !(info.protection & VM_PROT_WRITE)) return 0;
++        a = ra + rs;
++    }
++    return 1;
++}
+ int nvmtl_vk_buffer_import_host(void *ptr, size_t size, nvk_buffer *out)
+ {
+     if (nvmtl_vk_init()) return -1;
+@@ -1403,6 +1421,10 @@
+     if (((uintptr_t)ptr & (g_host_align - 1)) || (size & (g_host_align - 1))) {
+         static int said; if (!said++) nvlog("vk: host-pointer import refused — ptr %p / size %zu are not both a multiple of %zu; that buffer is COPIED",
+                                             ptr, size, g_host_align);
++        return -1;
++    }
++    if (!nvmtl_range_writable(ptr, size)) {
++        static int said; if (said++ < 4) nvlog("vk: host-pointer import refused — %p (+%zu) is not all writable memory; that buffer is COPIED", ptr, size);
+         return -1;
+     }
+     VkMemoryHostPointerPropertiesEXT mhp = { VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT, NULL, 0 };
