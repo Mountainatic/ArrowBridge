@@ -1,6 +1,6 @@
-# intel-xe-lpg-igpu-macos
+# ArrowBridge
 
-Intel Xe-LPG 核显在 macOS 上的显示通路试验。本仓库记录一台 hackintosh 笔记本把桌面合成与内置屏显示交给 Intel 核显的过程，内容包括在上游驱动 NvGfx 之上做的补丁、安装与验证脚本，以及按主题整理的技术笔记。
+**ArrowBridge** 是面向 Arrow Lake-HX Xe-LPG 核显的 macOS 图形与显示通路实验项目。本仓库记录一台 hackintosh 笔记本把桌面合成与内置屏显示交给 Intel 核显的过程，内容包括在上游 NvGfx / XeGfx 之上验证过的补丁、安装与验证脚本，以及按主题整理的技术笔记。
 
 仓库地址：<https://github.com/Mountainatic/intel-xe-lpg-igpu-macos>
 
@@ -10,7 +10,7 @@ Intel Xe-LPG 核显在 macOS 上的显示通路试验。本仓库记录一台 ha
 
 这台机器的核显是 Intel Xe-LPG（设备号 `8086:7D67`），macOS 没有为它提供显示驱动。项目以 NvGfx 的 XeGfx 分支为内核侧基础，把 GPU 与显示引擎接管过来，再通过 XeMTL 插件把 Metal 接到 Vulkan/ANV，让 WindowServer 在 Intel 核显上完成桌面合成。
 
-本仓库是这项工作在某个里程碑上的发布暂存区，形态是“补丁 + 脚本 + 文档”，不包含上游驱动的完整源码，也不包含 Apple 的 SDK 头文件或任何安装包。驱动基线是 NvGfx `xe` 分支的 XeGfx 0.0.44，插件线的基线是同一项目的 XeGfx 0.0.35。所有改动都以 unified diff 形式放在 `patches/`，按顺序应用即可复现项目里参与构建的源码树。
+ArrowBridge 当前以单机实测为中心，形态是“补丁 + 脚本 + 文档”，不包含上游驱动的完整源码，也不包含 Apple 的 SDK 头文件或任何安装包。驱动基线是 NvGfx `xe` 分支的 XeGfx 0.0.44，插件线的基线是同一项目的 XeGfx 0.0.35。所有改动都以 unified diff 形式放在 `patches/`，按顺序应用即可复现项目里参与构建的源码树。
 
 ## 硬件与系统
 
@@ -115,4 +115,4 @@ XeMTL 插件由 0.0.35 的插件目录改编，之后一直没有与 0.0.44 同�
 
 驱动主体来自 NullMoth Systems 的 macOS NVIDIA Metal 驱动，本项目使用 `watchthelight-labs/NvGfx` 的 `xe` 分支。内核侧的 family 与 NVRM 部分构建在 NVIDIA 开放 GPU 内核模块之上。第三方组件还包括 Mesa NVK（MIT）、metal2vulkan（作者 Anees Iqbal，LGPL-3.0 或更高版本）与 NVIDIA GSP 固件（NVIDIA 固件许可）。完整的署名与许可说明见 `NOTICE.md`。
 
-本项目为单机试验的记录，按现状提供，不承诺适用于其他机型或系统版本。
+ArrowBridge 为单机试验记录，按现状提供，不承诺适用于其他机型或系统版本。
