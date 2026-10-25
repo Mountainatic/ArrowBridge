@@ -1,0 +1,33 @@
+# Build products and scratch output from the project trees
+build/
+out/
+deps/
+reference/
+obj/
+pkg/
+
+# Compiler and debugger output
+*.o
+*.o.d
+*.dSYM/
+*.dylib
+*.a
+*.bin
+*.kext/
+*.bundle/
+
+# Python and shell scratch
+__pycache__/
+*.pyc
+*.pyo
+
+# Logs and trial artefacts
+*.log
+*.jsonl
+*.sample.txt
+soak-*/
+trial-*/
+
+# macOS folder metadata
+.DS_Store
+._*
