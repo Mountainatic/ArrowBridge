@@ -1,0 +1,406 @@
+# 0007 plugin: bounded first-failure journal for the Metal-on-Vulkan path
+#
+# Base:  this patch series, after 0006 (XeMTL plugin tree)
+# Files: plugin/nvmtl_first_loss.h (new)
+#        plugin/nvmtl_vk.c, plugin/nvmtl_vk.h, plugin/XeMTLDevice.m (modified)
+# Apply: patch -p1 < patches/0007-plugin-first-loss-journal.patch
+#
+# The plugin has no second chance after a Vulkan submit closes the backend, so the first failure
+# has to be recorded before it is overwritten.  The journal writes one JSON line per event (submit
+# begin/end, fence waits, bind-sparse, host-pointer import, image binding) to a bounded file, marks
+# the backend down exactly once, and preserves the Vulkan driver's own error text through syslog.
+# It is opt-in: set XEMTL_FIRST_LOSS_TRACE=1, or create /private/tmp/xemtl-first-loss-enable as
+# root so a launchd-started WindowServer picks it up; the log goes to
+# $XEMTL_FIRST_LOSS_DIR/xemtl-first-loss-<pid>.jsonl (default /private/tmp).  The same sentinel
+# also sets XEMTL_DRM_TRACE=1 for the libdrm ioctl trace in that process.
+#
+
+--- a/plugin/XeMTLDevice.m
++++ b/plugin/XeMTLDevice.m
+@@ -1016,6 +1016,7 @@
+         if (alias) {
+             alias->_viewParent = nil; alias->_usage = d.usage; alias->_ropt = t->_ropt; alias->_fbo = t->_fbo;
+             nvmtl_texture_desc_swizzle(alias, d);
++            if(surf)nvmtl_vk_diag_surface([alias nvi],IOSurfaceGetID(surf));
+             return alias;
+         }
+     }
+@@ -1023,6 +1024,7 @@
+         nvlog("newTextureWithDescriptor:iosurface:plane: image create FAILED (%zux%zu)", w, h); return nil; }
+     t->_q = nvmtl_device_queue();
+     t->_surf = surf; if (surf) { CFRetain(surf); t->_surfOwned = YES; }
++    if(surf)nvmtl_vk_diag_surface(&t->_i,IOSurfaceGetID(surf));
+     t->_plane = plane;
+     t->_fmt = d.pixelFormat;
+     t->_stex = t->_i.storage != 0;
+--- /dev/null
++++ b/plugin/nvmtl_first_loss.h
+@@ -0,0 +1,143 @@
++/* Opt-in bounded Vulkan first-failure journal. No retry or resource retirement. */
++#pragma once
++#include <fcntl.h>
++#include <pthread.h>
++#include <stdatomic.h>
++#include <stdlib.h>
++#include <time.h>
++#include <unistd.h>
++
++typedef struct {
++    uint64_t id;
++    VkCommandBuffer cb;
++    VkFence fence;
++    uint32_t witness;
++    int submit_called;
++    char who[768];
++} nvmtl_loss_context;
++static pthread_once_t nvmtl_loss_once = PTHREAD_ONCE_INIT;
++static pthread_mutex_t nvmtl_loss_lock = PTHREAD_MUTEX_INITIALIZER;
++static _Atomic uint64_t nvmtl_loss_ids;
++static _Atomic int nvmtl_loss_fd = -1;
++static unsigned nvmtl_loss_lines, nvmtl_loss_reserved;
++static void nvmtl_loss_open(void) {
++    /* Usually opt-in through NVMTL_FIRST_LOSS_TRACE=1. The journal can also be
++     * enabled by root creating /private/tmp/xemtl-first-loss-enable, because a
++     * launchd-started WindowServer cannot be given an environment from outside
++     * the job definition. NVMTL_FIRST_LOSS_TRACE=0 still forces it off. */
++    const char *on=getenv("XEMTL_FIRST_LOSS_TRACE");
++    int sentinel = on == NULL && access("/private/tmp/xemtl-first-loss-enable", F_OK) == 0;
++    if (on && strcmp(on,"0") == 0) return;
++    if ((!on || strcmp(on,"1")) && !sentinel) return;
++    char path[1024];const char *dir=getenv("XEMTL_FIRST_LOSS_DIR");
++    int n=snprintf(path,sizeof path,"%s/xemtl-first-loss-%d.jsonl",dir?dir:"/private/tmp",getpid());
++    if(n<0 || (size_t)n>=sizeof path)return;
++    nvmtl_loss_fd=open(path,O_WRONLY|O_CREAT|O_EXCL|O_APPEND|O_NOFOLLOW|O_CLOEXEC,0600);
++}
++static void nvmtl_loss_bootstrap_env(void) {
++    /* The sentinel that enables this journal also arms the libdrm XEGFX_IOCTL
++     * trace in this process before libvulkan_intel opens libdrm. A
++     * launchd-started WindowServer cannot be given an environment from outside
++     * the job definition, so the plugin sets it from here. */
++    static _Atomic int done;
++    if (atomic_exchange(&done, 1)) return;
++    if (getenv("XEMTL_DRM_TRACE")) return;
++    if (access("/private/tmp/xemtl-first-loss-enable", F_OK) == 0)
++        setenv("XEMTL_DRM_TRACE", "1", 1);
++}
++static void nvmtl_loss_quote(const char *s,char *out,size_t cap) {
++    size_t j=0; if(!s)s="";
++    for(size_t i=0;s[i]&&j+2<cap;i++) {
++        unsigned char c=(unsigned char)s[i];
++        if(c=='"'||c=='\\')out[j++]='\\';
++        out[j++]=c>=32?c:'?';
++    }
++    out[j]=0;
++}
++static uint64_t nvmtl_loss_now(void) {
++    struct timespec t;clock_gettime(CLOCK_MONOTONIC_RAW,&t);
++    return (uint64_t)t.tv_sec*1000000000ull+t.tv_nsec;
++}
++static void nvmtl_loss_event(const char *event,const nvmtl_loss_context *ctx,int called,int result,
++                            int before,int after,uint64_t elapsed,uintptr_t object0,uintptr_t object1,uint64_t amount,int reserved) {
++    pthread_once(&nvmtl_loss_once,nvmtl_loss_open);
++    if(nvmtl_loss_fd<0)return;
++    pthread_mutex_lock(&nvmtl_loss_lock);
++    if(nvmtl_loss_fd<0){pthread_mutex_unlock(&nvmtl_loss_lock);return;}
++    if((!reserved&&nvmtl_loss_lines>=2048)||(reserved==1&&nvmtl_loss_reserved>=32)) {
++        pthread_mutex_unlock(&nvmtl_loss_lock);return;
++    }
++    if(reserved)nvmtl_loss_reserved++;else nvmtl_loss_lines++;
++    char who[1550],ev[160],actual[32],line[3200];uint64_t tid=0;
++    nvmtl_loss_quote(ctx?ctx->who:"",who,sizeof who);nvmtl_loss_quote(event,ev,sizeof ev);
++    if(called)snprintf(actual,sizeof actual,"%d",result);else strcpy(actual,"null");
++    pthread_threadid_np(NULL,&tid);struct timespec wall;clock_gettime(CLOCK_REALTIME,&wall);
++    int n=snprintf(line,sizeof line,
++      "{\"event\":\"%s\",\"pid\":%d,\"tid\":%llu,\"instance\":\"%p\",\"unixNs\":%llu,\"monotonicNs\":%llu,"
++      "\"submitID\":%llu,\"who\":\"%s\",\"commandBuffer\":\"%p\",\"fence\":\"%p\",\"queue\":\"%p\",\"witness\":%u,"
++      "\"actualCall\":%s,\"actualResult\":%s,\"reportedResult\":%d,\"stateBefore\":%d,\"stateAfter\":%d,\"elapsedNs\":%llu,"
++      "\"object0\":\"0x%llx\",\"object1\":\"0x%llx\",\"amount\":%llu,\"noSurfaceHostRequested\":%s}\n",
++      ev,getpid(),(unsigned long long)tid,(void*)&g_state,
++      (unsigned long long)((uint64_t)wall.tv_sec*1000000000ull+wall.tv_nsec),(unsigned long long)nvmtl_loss_now(),
++      (unsigned long long)(ctx?ctx->id:0),who,(void*)(ctx?ctx->cb:NULL),(void*)(ctx?ctx->fence:NULL),(void*)g_queue,ctx?ctx->witness:0,
++      called?"true":"false",actual,result,before,after,(unsigned long long)elapsed,
++      (unsigned long long)object0,(unsigned long long)object1,(unsigned long long)amount,
++      getenv("XEMTL_NO_SURFACE_HOST")&&getenv("XEMTL_NO_SURFACE_HOST")[0]=='1'?"true":"false");
++    if(n>0&&(size_t)n<sizeof line) {
++        if(write(nvmtl_loss_fd,line,(size_t)n)!=n){close(nvmtl_loss_fd);nvmtl_loss_fd=-1;}
++        else if(reserved)fsync(nvmtl_loss_fd);
++    }
++    pthread_mutex_unlock(&nvmtl_loss_lock);
++}
++static void nvmtl_loss_context_init(nvmtl_loss_context *c,VkCommandBuffer cb,const char *who) {
++    memset(c,0,sizeof *c);c->id=atomic_fetch_add(&nvmtl_loss_ids,1)+1;c->cb=cb;
++    snprintf(c->who,sizeof c->who,"%s",who?who:"unspecified");
++}
++static _Atomic unsigned nvmtl_loss_report_requests;
++static VkResult nvmtl_loss_queue_submit(nvmtl_loss_context *c,const VkSubmitInfo *si,VkFence fence,int guard_state) {
++    c->fence=fence;int before=atomic_load(&g_state),called=!guard_state||before==1;c->submit_called=called;
++    nvmtl_loss_event("queue_submit_begin",c,0,0,before,before,0,
++        si->commandBufferCount>1?(uintptr_t)si->pCommandBuffers[0]:0,
++        si->commandBufferCount>2?(uintptr_t)si->pCommandBuffers[1]:0,si->commandBufferCount,0);
++    uint64_t t=nvmtl_loss_now();
++    VkResult result=called?pvkQueueSubmit(g_queue,1,si,fence):VK_ERROR_DEVICE_LOST;
++    nvmtl_loss_event("queue_submit_end",c,called,result,before,atomic_load(&g_state),nvmtl_loss_now()-t,0,0,0,result!=VK_SUCCESS);
++    /* Mesa queues retain the failure text until a device-status check reports
++     * it. Query once, without waiting or resubmitting, before our caller stops
++     * using the failed backend. Preserve the original queue result. */
++    if (called && result == VK_ERROR_DEVICE_LOST && nvmtl_loss_fd >= 0 &&
++        atomic_fetch_add(&nvmtl_loss_report_requests, 1) == 0) {
++        uint64_t query_start = nvmtl_loss_now();
++        VkResult status = pvkWaitForFences(g_dev, 1, &fence, VK_TRUE, 0);
++        nvmtl_loss_event("post_loss_status_query", c, 1, status,
++            atomic_load(&g_state), atomic_load(&g_state),
++            nvmtl_loss_now()-query_start, 0, 0, 0, 1);
++    }
++    return result;
++}
++static VkResult nvmtl_loss_wait(nvmtl_loss_context *c,uint64_t timeout) {
++    int before=atomic_load(&g_state);
++    nvmtl_loss_event("fence_wait_begin",c,0,0,before,before,0,0,0,timeout,0);
++    uint64_t t=nvmtl_loss_now();
++    VkResult r=pvkWaitForFences(g_dev,1,&c->fence,VK_TRUE,timeout);
++    nvmtl_loss_event("fence_wait_end",c,1,r,before,atomic_load(&g_state),nvmtl_loss_now()-t,0,0,timeout,r!=VK_SUCCESS&&r!=VK_TIMEOUT);
++    return r;
++}
++static void nvmtl_loss_mark_down(const char *why,const nvmtl_loss_context *c,int called,int result,uint64_t elapsed) {
++    int before=atomic_exchange(&g_state,-1);
++    if(before==1)nvlog("vk: FIRST_BACKEND_DOWN pid %d instance %p reason %s submit %llu cb %p actual_call %d result %d",
++        getpid(),(void*)&g_state,why,(unsigned long long)(c?c->id:0),(void*)(c?c->cb:NULL),called,result);
++    nvmtl_loss_event(before==1?why:"backend_down_already_observed",c,called,result,before,-1,elapsed,0,0,0,before==1?2:1);
++}
++
++/* Driver callback text is evidence, not an API return or a backend transition.
++ * Reserve the first error even after ordinary trace capacity is exhausted. */
++static _Atomic unsigned nvmtl_loss_driver_errors;
++static void nvmtl_loss_driver_message(const char *message, int error) {
++    nvmtl_loss_context c = {0};
++    snprintf(c.who, sizeof c.who, "%s", message ? message : "(no message)");
++    int state = atomic_load(&g_state);
++    int reserve = error ? (atomic_fetch_add(&nvmtl_loss_driver_errors, 1) == 0 ? 2 : 1) : 0;
++    nvmtl_loss_event(error ? "vulkan_driver_error" : "vulkan_driver_warning",
++        &c, 0, 0, state, state, 0, 0, 0, 0, reserve);
++}
+--- a/plugin/nvmtl_vk.c
++++ b/plugin/nvmtl_vk.c
+@@ -12,6 +12,7 @@
+ #include <mach/vm_region.h>
+ #include <unistd.h>
+ #include <stdio.h>
++#include <syslog.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include <stdint.h>
+@@ -312,6 +313,11 @@
+ 
+ INSTANCE_FNS(DECL) DEVICE_FNS(DECL)
+ #undef DECL
++#include "nvmtl_first_loss.h"
++void nvmtl_vk_diag_surface(nvk_image *image,uint32_t surfaceID) {
++    if(image)nvmtl_loss_event("iosurface_image_binding",NULL,0,0,g_state,g_state,0,
++                             (uintptr_t)image->img,(uintptr_t)image->mem,surfaceID,0);
++}
+ #define LOAD_I(f) do { p##f = (PFN_##f)pvkGetInstanceProcAddr(g_inst, #f); if (!p##f) { nvlog("vk: missing %s", #f); return -1; } } while (0);
+ #define LOAD_D(f) do { p##f = (PFN_##f)pvkGetDeviceProcAddr(g_dev, #f);   if (!p##f) { nvlog("vk: missing %s", #f); return -1; } } while (0);
+ 
+@@ -560,6 +566,11 @@
+     const char *b = strrchr(id, '/'); b = b ? b + 1 : id;
+     char t[600]; snprintf(t, sizeof t, "nvk-reason: %s %s: %s", (sev & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) ? "E" : "W", b, m);
+     for (char *c = t; *c; c++) if ((unsigned char)*c < 0x20) *c = ' ';
++    /* The temporary file can vanish on reboot. Preserve ANV's reason in the
++     * system log as well, without nvlog's second, format-wide rate limiter. */
++    const int error = (sev & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) != 0;
++    syslog(error ? LOG_ERR : LOG_NOTICE, "XeMTL Vulkan: %s", t);
++    nvmtl_loss_driver_message(t, error);
+     extern const char *nvmtl_log_path(void);
+     FILE *f = fopen(nvmtl_log_path(), "a");
+     if (f) {
+@@ -1065,8 +1076,12 @@
+     return 0;
+ }
+ static pthread_once_t g_vk_once = PTHREAD_ONCE_INIT;
+-static void nvmtl_vk_initialize_once(void) { (void)nvmtl_vk_initialize(); }
++static void nvmtl_vk_initialize_once(void) {
++    int r=nvmtl_vk_initialize();
++    nvmtl_loss_event("initialize_once_result",NULL,0,r,0,g_state,0,0,0,0,r!=0);
++}
+ int nvmtl_vk_init(void) {
++    nvmtl_loss_bootstrap_env();
+     pthread_once(&g_vk_once, nvmtl_vk_initialize_once);
+     return g_state == 1 ? 0 : -1;
+ }
+@@ -1231,9 +1246,14 @@
+     VkFenceCreateInfo fci = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, NULL, 0 }; VkFence f = VK_NULL_HANDLE;
+     if (pvkCreateFence(g_dev, &fci, NULL, &f) != VK_SUCCESS) return -1;
+     pthread_mutex_lock(&nvmtl_submit_mutex);
+-    VkResult r = g_state == 1 ? pvkQueueBindSparse(g_queue, 1, &bsi, f) : VK_ERROR_DEVICE_LOST;
++    nvmtl_loss_context sparseContext;nvmtl_loss_context_init(&sparseContext,NULL,"sparse_bind");sparseContext.fence=f;
++    int sparseBefore=g_state,sparseCalled=sparseBefore==1;uint64_t sparseStart=nvmtl_loss_now();
++    nvmtl_loss_event("queue_bind_sparse_begin",&sparseContext,0,0,sparseBefore,sparseBefore,0,(uintptr_t)b,(uintptr_t)mem,size,0);
++    VkResult r = sparseCalled ? pvkQueueBindSparse(g_queue, 1, &bsi, f) : VK_ERROR_DEVICE_LOST;
++    nvmtl_loss_event("queue_bind_sparse_end",&sparseContext,sparseCalled,r,sparseBefore,g_state,
++                    nvmtl_loss_now()-sparseStart,(uintptr_t)b,(uintptr_t)mem,size,r!=VK_SUCCESS);
+     pthread_mutex_unlock(&nvmtl_submit_mutex);
+-    if (r == VK_SUCCESS) r = pvkWaitForFences(g_dev, 1, &f, VK_TRUE, 5000000000ull);
++    if (r == VK_SUCCESS) r = nvmtl_loss_wait(&sparseContext,5000000000ull);
+     pvkDestroyFence(g_dev, f, NULL);
+     if (r != VK_SUCCESS) nvlog("residency (res3): vkQueueBindSparse(%s%s, %llu MB) -> %d", unbind_first ? "unbind + " : "",
+                                mem ? "bind" : "nothing", (unsigned long long)(size >> 20), r);
+@@ -1458,6 +1478,7 @@
+         pvkFreeMemory(g_dev, (VkDeviceMemory)out->mem, NULL); pvkDestroyBuffer(g_dev, (VkBuffer)out->buf, NULL);
+         out->buf = NULL; out->mem = NULL; return -1; }
+     out->map = ptr; out->alloc = size; out->imported = 1; out->mtype1 = mt + 1;
++    nvmtl_loss_event("host_pointer_import",NULL,0,0,g_state,g_state,0,(uintptr_t)out->buf,(uintptr_t)out->mem,size,0);
+     g_alloc_bytes += size; g_buf_made++;
+     { static int said; if (!said++) nvlog("vk: imported the caller's pages as device memory — %zu bytes at %p, memory type %d", size, ptr, mt); }
+     return 0;
+@@ -5322,9 +5343,10 @@
+     VkFenceCreateInfo fci = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, NULL, 0 };
+     if (pvkCreateFence(g_dev, &fci, NULL, &fence) != VK_SUCCESS) { nvlog("vk: dummy zero-fill SKIPPED — vkCreateFence failed; an unbound texture still samples uninitialised memory"); return; }
+     VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 0, NULL, NULL, 1, &cb, 0, NULL };
+-    VkResult sr = pvkQueueSubmit(g_queue, 1, &si, fence);
++    nvmtl_loss_context zeroContext;nvmtl_loss_context_init(&zeroContext,cb,"dummy_image_zero_fill");
++    VkResult sr = nvmtl_loss_queue_submit(&zeroContext,&si,fence,0);
+     if (sr != VK_SUCCESS) { nvlog("vk: dummy zero-fill FAILED — vkQueueSubmit -> %d; an unbound texture still samples uninitialised memory", sr); pvkDestroyFence(g_dev, fence, NULL); return; }
+-    VkResult wr = pvkWaitForFences(g_dev, 1, &fence, VK_TRUE, 2000000000ull);
++    VkResult wr = nvmtl_loss_wait(&zeroContext,2000000000ull);
+     pvkDestroyFence(g_dev, fence, NULL);
+     if (wr != VK_SUCCESS) { nvlog("vk: dummy zero-fill did not complete — vkWaitForFences -> %d; an unbound texture may still sample uninitialised memory", wr); return; }
+     nvlog("vk: dummy images ZEROED and transitioned (sampled -> SHADER_READ_ONLY_OPTIMAL%s) — a declared-but-unbound texture now reads opaque black, not uninitialised VRAM",
+@@ -5671,7 +5693,7 @@
+     for (unsigned i = 0; i < p->nhold; i++) if (p->hold[i] && nvmtl_pre_release_hook) nvmtl_pre_release_hook(p->hold[i]);
+     p->nhold = 0;
+ }
+-struct nvmtl_inflight { nvk_cmdbuf *c; VkFence fence; nvmtl_prologue pre; uint64_t pt[8]; };
++struct nvmtl_inflight { nvk_cmdbuf *c; VkFence fence; nvmtl_prologue pre; uint64_t pt[8]; nvmtl_loss_context loss; };
+ nvmtl_inflight *nvmtl_vk_inflight_new(void) { return calloc(1, sizeof(nvmtl_inflight)); }
+ void nvmtl_vk_inflight_free(nvmtl_inflight *f) { free(f); }
+ void nvmtl_vk_gsub_nvk_stats(uint64_t *out, unsigned n)
+@@ -5716,8 +5738,13 @@
+ {
+     nvmtl_subwho_note(who, 0);
+     memset(f, 0, sizeof *f); f->c = c;
++    nvmtl_loss_context_init(&f->loss,c?(VkCommandBuffer)c->cb:NULL,who);
+     uint64_t *const pt = f->pt;
+-    if (g_state != 1 || !c || !c->cb) return -2;
++    if (g_state != 1 || !c || !c->cb) {
++        nvmtl_loss_event(g_state!=1?"submit_skipped_backend_down":"submit_invalid_command_buffer",
++                        &f->loss,0,-2,g_state,g_state,0,0,0,0,1);
++        return -2;
++    }
+     if (c->counter_error || nvmtl_counter_flush(c)) { nvmtl_cmd_retire(c); return -1; }
+     VkCommandBuffer counter_reset = VK_NULL_HANDLE;
+     if (nvmtl_counter_reset_finish(c, &counter_reset)) { nvmtl_cmd_retire(c); return -1; }
+@@ -5774,12 +5801,13 @@
+     nvmtl_wit_control(wseq);
+     const uint64_t sE = nvmtl_perf_now();
+     if (pt[0]) { pt[1] = pt[0] + (sA - pt[0]) + (sD - sC); pt[2] = pt[1] + (sB - sA) + (sE - sD); pt[3] = pt[2] + (sC - sB); }
+-    result = g_state == 1 ? pvkQueueSubmit(g_queue, 1, &si, fence) : VK_ERROR_DEVICE_LOST;
++    f->loss.witness=wseq;
++    result = nvmtl_loss_queue_submit(&f->loss,&si,fence,1);
+     pthread_mutex_unlock(&nvmtl_submit_mutex);
+     pt[4] = nvmtl_perf_now();
+     g_cmd_submitted++;
+     if (result != VK_SUCCESS) {
+-        g_state = -1;
++        nvmtl_loss_mark_down("queue_result_closed_backend",&f->loss,f->loss.submit_called,result,0);
+         nvlog("vk: queue submit -> %d; disabling backend and retaining uncertain in-flight resources", result);
+         return -2;
+     }
+@@ -5803,7 +5831,7 @@
+     const long give_up_ms = budget_ms * 10;
+     for (;;) {
+         const long slice_ms = budget_ms < 250 ? 500 : budget_ms * 2;
+-        wr = pvkWaitForFences(g_dev, 1, &fence, VK_TRUE, (uint64_t)slice_ms * 1000 * 1000);
++        wr = nvmtl_loss_wait(&f->loss,(uint64_t)slice_ms * 1000 * 1000);
+         waited_ms = (long)((clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - w0) / 1000000ull);
+         if (wr != VK_TIMEOUT) break;
+         if (g_state != 1) break;
+@@ -5825,13 +5853,14 @@
+             nvlog("vk: slowest submit so far %ld ms (budget %ld ms) - this is the wait the old 5 s watchdog called a dead device", waited_ms, budget_ms);
+     }
+     if (wr != VK_SUCCESS || g_state != 1) {
+-        g_state = -1;
++        nvmtl_loss_mark_down(wr==VK_TIMEOUT?"fence_timeout_policy_closed_backend":"fence_result_closed_backend",
++                            &f->loss,1,wr,(uint64_t)waited_ms*1000000ull);
+         nvlog("vk: fence wait -> %d after %ld ms (budget %ld ms); the device is lost, disabling backend without retiring in-flight resources", wr, waited_ms, budget_ms);
+         return -2;
+     }
+     if (c->wseq && c->wseq != NVMTL_WSEQ_BLIND) {
+         if (nvmtl_keep_verdict(c->wseq) < 0) {
+-            g_state = -1;
++            nvmtl_loss_mark_down("completion_witness_closed_backend",&f->loss,0,0,0);
+             nvlog("vk: completion witness missing; disabling backend and retaining all in-flight resources");
+             return -2;
+         }
+@@ -6320,6 +6349,7 @@
+     if (on < 0) {
+         const char *e = getenv("XEMTL_NO_SURFACE_HOST");
+         on = !nvmtl_vk_init() && g_host_import && g_host_align && nvmtl_vk_vendor() != 0x10de && !(e && e[0] == '1');
++        nvmtl_loss_event("surface_host_effective",NULL,0,0,g_state,g_state,0,0,0,on,0);
+         nvlog("vk: IOSurface copies %s (host import %s, NVMTL_NO_SURFACE_HOST=%s)", on ? "go straight to the surface's pages"
+               : "stage through a buffer", g_host_import ? "present" : "ABSENT", e ? e : "unset");
+     }
+@@ -6342,6 +6372,9 @@
+     nvk_cmdbuf c; if (nvmtl_vk_cmd_begin(q, &c)) return -1;
+     VkImageSubresourceRange range = { nvmtl_barrier_aspect(img), 0, 1, 0, 1 };
+     VkBufferImageCopy bic = { off, (uint32_t)(row_bytes / bpp), 0, { nvmtl_copy_aspect(img), 0, 0, 1 }, { 0, 0, 0 }, { img->w, img->h, 1 } };
++    nvmtl_loss_context hostContext={0};hostContext.cb=c.cb;
++    nvmtl_loss_event(to_image?"host_upload_binding":"host_readback_binding",&hostContext,0,0,g_state,g_state,0,
++                    (uintptr_t)img->img,(uintptr_t)hb->mem,row_bytes,0);
+     if (to_image) {
+         VkImageMemoryBarrier toDst = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, VK_ACCESS_MEMORY_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+             VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, (VkImage)img->img, range };
+@@ -6369,6 +6402,9 @@
+ static void img_to(nvk_cmdbuf *c, nvk_image *img, VkImageLayout to,
+                    VkAccessFlags srcA, VkAccessFlags dstA, VkPipelineStageFlags srcS, VkPipelineStageFlags dstS)
+ {
++    nvmtl_loss_context imageContext={0};imageContext.cb=c->cb;
++    nvmtl_loss_event("command_image_binding",&imageContext,0,0,g_state,g_state,0,
++                    (uintptr_t)img->img,(uintptr_t)img->mem,((uint64_t)img->w<<32)|img->h,0);
+     if ((VkImageLayout)img->layout == to) return;
+     VkImageSubresourceRange r = { nvmtl_barrier_aspect(img), 0, img->mips ? img->mips : 1, 0, img->layers ? img->layers : 1 };
+     VkImageMemoryBarrier b = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, srcA, dstA,
+@@ -6505,6 +6541,16 @@
+     pvkCmdCopyBufferToImage(c->cb, (VkBuffer)stageb->buf, (VkImage)img->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bic);
+     img_to(c, img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
++    char upload_label[256];
++    snprintf(upload_label, sizeof upload_label,
++        "tex_upload_%s image=%p fmt=%u extent=%ux%u region=%u,%u+%ux%u level=%u layer=%u staging=%p bytes=%zu",
++        au ? "async" : "sync", img->img, img->fmt, img->w, img->h,
++        x, y, w, h, level, layer, stageb->buf, bytes);
++    nvmtl_loss_context upload_context = {0};
++    upload_context.cb = (VkCommandBuffer)c->cb;
++    snprintf(upload_context.who, sizeof upload_context.who, "%s", upload_label);
++    nvmtl_loss_event("texture_upload_recorded", &upload_context, 0, 0, g_state, g_state,
++        0, (uintptr_t)img->img, (uintptr_t)stageb->buf, bytes, 0);
+     if (au) {
+         // submit without waiting; queue order + the SHADER_READ barrier above order the copy before any later
+         // draw that samples this image, and the handle is finished before a readback, destroy or re-upload.
+@@ -6512,7 +6558,7 @@
+         nvmtl_asyncup_store(img, (uint64_t)(uintptr_t)au);
+         return 0;
+     }
+-    return nvmtl_vk_submit_wait(c);
++    return nvmtl_vk_submit_wait_at(c, "tex upload sync");
+ }
+ 
+ int nvmtl_vk_image_read_region_level(nvk_queue *q, nvk_image *img, void *dst, size_t row_bytes,
+@@ -7466,6 +7512,8 @@
+     int result = nvmtl_vk_image_create_buffer_alias_lifetime_body(w, h, vkfmt, bpp, a8, storage, render, b, offset, row_pitch, &pending);
+     if (result) { nvmtl_failed_image(&pending); memset(out, 0, sizeof *out); }
+     else { nvmtl_commit_image(&pending); *out = pending; }
++    if(!result)nvmtl_loss_event("buffer_image_alias",NULL,0,0,g_state,g_state,0,
++                              (uintptr_t)out->img,(uintptr_t)b->mem,b->imported,0);
+     return result;
+ }
+ static int nvmtl_vk_image_create_buffer_alias_lifetime_body(uint32_t w, uint32_t h, uint32_t vkfmt, uint32_t bpp, int a8, int storage, int render,
+--- a/plugin/nvmtl_vk.h
++++ b/plugin/nvmtl_vk.h
+@@ -219,6 +219,7 @@
+ int  nvmtl_vk_image_read(nvk_queue *q, nvk_image *img, void *dst, size_t row_bytes);
+ int  nvmtl_vk_surface_host_on(void);
+ int  nvmtl_vk_surface_host_import(void *base, size_t alloc, nvk_buffer *out);
++void nvmtl_vk_diag_surface(nvk_image *image,uint32_t surfaceID);
+ int  nvmtl_vk_image_xfer_host(nvk_queue *q, nvk_image *img, nvk_buffer *hb, size_t off, size_t row_bytes, int to_image);
+ int  nvmtl_vk_image_write(nvk_queue *q, nvk_image *img, const void *src, size_t row_bytes);
+ int  nvmtl_vk_copy_buffer(nvk_queue *q, nvk_buffer *src, size_t srcOff, nvk_buffer *dst, size_t dstOff, size_t size);
