@@ -63,4 +63,9 @@ DEALINGS IN THE SOFTWARE.
 
 ## 五、本仓库自身的许可
 
-本仓库的补丁、脚本与文档作为上述上游工作的衍生部分，沿用 PolyForm Noncommercial License 1.0.0，全文见 `LICENSE`。该许可将使用范围限定为非商业用途；商业使用需要另行取得授权。
+本仓库按内容分成两部分：
+
+- `patches/`：对上游 NvGfx 源码的修改，属于上游工作的衍生部分，必须沿用上游的 PolyForm Noncommercial License 1.0.0，全文见 `LICENSE`。该许可把使用范围限定在非商业用途；商业使用需要另行取得授权。上游 README 明确写明「source-available, not open source」，这一限制不能由本仓库单方面放宽。
+- `scripts/`、`docs/`、`README.md`、`NOTICE.md` 等由本项目原创的内容：以 MIT 许可发布，全文见 `LICENSE-MIT`。这部分可以自由使用、修改和再分发，保留版权声明即可。
+
+拼装或再分发本仓库时，请分别遵守这两份许可：改动上游代码的部分保留 PolyForm Noncommercial 1.0.0，只使用原创脚本与文档的部分按 MIT 处理。

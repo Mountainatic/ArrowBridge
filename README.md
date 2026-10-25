@@ -111,7 +111,7 @@ XeMTL 插件由 0.0.35 的插件目录改编，之后一直没有与 0.0.44 同�
 
 ## 许可与致谢
 
-本仓库的补丁、脚本与文档沿用 PolyForm Noncommercial License 1.0.0，全文见 `LICENSE`；该许可将使用范围限定为非商业用途。
+本仓库按内容分成两份许可：`patches/` 是对上游 NvGfx 源码的修改，属于上游衍生部分，沿用上游的 PolyForm Noncommercial License 1.0.0（全文见 `LICENSE`），仅限非商业用途；`scripts/`、`docs/`、`README.md`、`NOTICE.md` 这些原创内容以 MIT 许可发布（全文见 `LICENSE-MIT`），保留版权声明即可自由使用。
 
 驱动主体来自 NullMoth Systems 的 macOS NVIDIA Metal 驱动，本项目使用 `watchthelight-labs/NvGfx` 的 `xe` 分支。内核侧的 family 与 NVRM 部分构建在 NVIDIA 开放 GPU 内核模块之上。第三方组件还包括 Mesa NVK（MIT）、metal2vulkan（作者 Anees Iqbal，LGPL-3.0 或更高版本）与 NVIDIA GSP 固件（NVIDIA 固件许可）。完整的署名与许可说明见 `NOTICE.md`。
 
