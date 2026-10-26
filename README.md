@@ -46,7 +46,7 @@
 
    WindowServer 先把一帧合成到 IOSurface。XeGfxAccel 收到 display-pipe transaction 后等待下一次 vblank，再把这一帧写入 firmware framebuffer aperture。显示引擎持续扫描同一块 aperture，新的桌面内容随后进入内屏。
 
-   当前这条路径使用每帧约 16 MB 的 CPU copy。它已经完成连续 present 验证，也是后续原生 flip 的过渡基础。
+   当前这条路径仍使用每帧约 16 MB 的 CPU copy。连续 present 已经验证完成，下一步正在推进零拷贝，让显示引擎直接扫描 surface backing，把整帧 CPU copy 从主路径中移走。
 
 ## 推进过程中解决的问题
 
@@ -102,26 +102,9 @@ ArrowBridge 先从 BAR0 读取 live timing，再由 XeGfxIntelFB 补充 `getInfo
 
 当前 display-pipe 使用 IOSurface 到 framebuffer aperture 的整帧 copy。2560x1600 XRGB 一帧为 16384000 字节。
 
-实测平均 copy 耗时约 2.26 ms，平均 transaction 耗时约 11.1 ms。桌面 present 频率主要受 WindowServer 合成节拍影响，因此当前优化顺序先处理 30 Hz timing 与 display link，再推进 native flip。
+实测平均 copy 耗时约 2.26 ms，平均 transaction 耗时约 11.1 ms。桌面 present 频率主要受 WindowServer 合成节拍影响。当前一边继续修正 30 Hz timing 与 display link，一边推进零拷贝显示路径。
 
-native flip 落地后，显示引擎将直接扫描可见的 surface backing，整帧 CPU copy 会退出主路径。
-
-## 当前状态
-
-| 项目 | 状态 | 说明 |
-| --- | --- | --- |
-| i915 core | 已工作 | GuC、render、copy、compute engine 已启动 |
-| Vulkan | 已工作 | Mesa ANV 可创建 Vulkan device 并执行 compute 与 draw |
-| Metal | 已工作 | XeMTL 可执行 compute 与 render pipeline |
-| WindowServer 合成 | 已工作 | 桌面由 Intel Xe-LPG 完成 Metal 合成 |
-| 内屏输出 | 已工作 | head 4 与 display-pipe 连续 present 已验证 |
-| userptr 稳定性 | 已完成长压测 | 40 分钟级 churn 保持稳定 |
-| device lost 主链 | 已修正 | 只读 host mapping 进入 copy path |
-| 面板真实 timing | 已测得 | 2560x1600，59.877 Hz |
-| 系统刷新节拍 | 验证中 | 正在确认 CGDisplayMode 与 CVDisplayLink |
-| 硬件光标 | 计划中 | 当前使用 WindowServer 软件光标 |
-| native flip | 计划中 | 当前使用整帧 CPU copy |
-| 睡眠与功耗 | 后续 | 后续接入完整电源状态验证 |
+零拷贝路线的目标是让显示引擎直接扫描可见的 surface backing，并在 vblank 边界完成切换。这样可以把整帧 CPU copy 从主路径中移走，并把 display-pipe 从过渡搬运路径推进到真正的 surface 直出。
 
 ## 硬件与系统
 
