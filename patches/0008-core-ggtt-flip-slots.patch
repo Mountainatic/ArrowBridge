@@ -1,0 +1,205 @@
+# 0008 xg: give the compositor's frames GGTT slots so the plane can scan them out directly
+#
+# Base:  NvGfx xe 5a19a73f36249efb99c44c3f9cb34603ef0c0eb8 (XeGfx 0.0.44)
+# Requires: patches/0001-xg_vm-userptr-race.patch (touches the same tree, not these files)
+# Files: gpu/xegfx/shim/include/xg_i915.h (modified)
+#        gpu/xegfx/shim/src/xnu/xg_kext.cpp (modified)
+#        gpu/xkpi/src/i915/xg_i915_exec.c (modified: expose xg_i915_dev())
+#        gpu/xkpi/src/i915/xg_i915_flip.c (new)
+# Apply: patch -p1 < patches/0008-core-ggtt-flip-slots.patch
+#
+# The accelerator owns the display pipe but the frame the compositor hands it lives in system memory.
+# This side already owns the GGTT page tables, so it reserves a few slots in the global GGTT
+# (i915_gem_gtt_insert with I915_COLOR_UNEVICTABLE), rewrites a slot's PTEs for a frame's physical pages
+# (ggtt->vm.insert_page + ggtt->invalidate) and exposes three kernel calls through the XeGfxResident
+# callPlatformFunction bridge: xgFlipInit / xgFlipMap / xgFlipUnmap.  xg_i915_dev() lets the other file reach
+# the i915_private that the driver-side KPI already looked up.  Slots are never freed; unmapping just points
+# the slot at a scratch page so nothing stale can be scanned out.
+#
+--- a/gpu/xegfx/shim/include/xg_i915.h
++++ b/gpu/xegfx/shim/include/xg_i915.h
+@@ -48,6 +48,13 @@
+ int xg_i915_store(struct xg_i915_store *sd, int timeout_ms);
+ /* keep i915 off the GGTT range the boot surface scans out of (Hybrid, display disabled); 0 or a negative errno */
+ int xg_i915_reserve_bootfb(unsigned long long offset, unsigned long long size);
++#define XG_FLIP_MAX_SLOTS	8
++/* zero-copy scanout: reserve GGTT slots, then point one slot's PTEs at a frame's physical pages; 0 or -errno */
++int xg_flip_init(unsigned long long surface_bytes, unsigned int slots, unsigned long long *ggtt_out,
++    unsigned int *count_out);
++int xg_flip_map(unsigned int slot, unsigned long long surface_bytes, const unsigned long long *phys,
++    unsigned int npages);
++int xg_flip_unmap(unsigned int slot, unsigned long long surface_bytes);
+ 
+ #ifdef __cplusplus
+ }
+--- a/gpu/xegfx/shim/src/xnu/xg_kext.cpp
++++ b/gpu/xegfx/shim/src/xnu/xg_kext.cpp
+@@ -154,6 +154,23 @@
+ 		*(int *)p4 = xg_fd_remote_ioctl((int)(uintptr_t)p1, (unsigned long)p2, (unsigned long long)(uintptr_t)p3);
+ 		return kIOReturnSuccess;
+ 	}
++	/* "xgFlipInit" (surface bytes, slots wanted, u64 *ggtt out, unsigned *count out) / "xgFlipMap" (slot,
++	 * phys page array, npages, surface bytes) / "xgFlipUnmap" (slot, surface bytes): zero-copy scanout.  The
++	 * accelerator writes PLANE_SURF itself; this side owns the GGTT slots and the PTEs. */
++	if (name && name->isEqualTo("xgFlipInit") && p3 && p4) {
++		int err = xg_flip_init((unsigned long long)(uintptr_t)p1, (unsigned int)(uintptr_t)p2,
++		    (unsigned long long *)p3, (unsigned int *)p4);
++		return (err == 0 ? kIOReturnSuccess : kIOReturnError);
++	}
++	if (name && name->isEqualTo("xgFlipMap") && p2) {
++		int err = xg_flip_map((unsigned int)(uintptr_t)p1, (unsigned long long)(uintptr_t)p4,
++		    (const unsigned long long *)p2, (unsigned int)(uintptr_t)p3);
++		return (err == 0 ? kIOReturnSuccess : kIOReturnError);
++	}
++	if (name && name->isEqualTo("xgFlipUnmap")) {
++		int err = xg_flip_unmap((unsigned int)(uintptr_t)p1, (unsigned long long)(uintptr_t)p2);
++		return (err == 0 ? kIOReturnSuccess : kIOReturnError);
++	}
+ 	/* "xgTrace" (const char *line): XeGfxAccel's state, stored with the console trace (thread context only) */
+ 	if (name && name->isEqualTo("xgTrace") && p1 && gLogLock) {
+ 		IOInterruptState is = IOSimpleLockLockDisableInterrupt(gLogLock);
+--- a/gpu/xkpi/src/i915/xg_i915_exec.c
++++ b/gpu/xkpi/src/i915/xg_i915_exec.c
+@@ -34,6 +34,14 @@
+ 	return (NULL);
+ }
+ 
++struct drm_i915_private *
++xg_i915_dev(void)
++{
++	struct pci_dev *pdev = NULL;
++
++	return (xg_i915_find(&pdev));
++}
++
+ int
+ xg_i915_state(struct xg_i915_state *st)
+ {
+--- /dev/null
++++ b/gpu/xkpi/src/i915/xg_i915_flip.c
+@@ -0,0 +1,125 @@
++// SPDX-License-Identifier: MIT
++/*
++ * Zero-copy scanout: reserved GGTT slots whose PTEs point at the compositor's own frame pages.  The accelerator
++ * (XeGfxAccel) writes PLANE_SURF_1_A itself; this file only owns the GGTT side - reserve, PTE writes, invalidate.
++ * A frame that the display scans out of its own memory is not copied at all, so this is the end of the CPU
++ * copy path. <wtl> project: xegfx | author: watchthelight </wtl>
++ */
++#include <linux/pci.h>
++#include <linux/string.h>
++#include <linux/io.h>
++
++#include "i915_drv.h"
++#include "gt/intel_gt.h"
++#include "gt/intel_gtt.h"
++#include "i915_gem_gtt.h"
++#include "gem/i915_gem_object.h"
++
++#include "xg_i915.h"
++
++extern struct drm_i915_private *xg_i915_dev(void);
++
++static struct drm_mm_node gXgFlipNode[XG_FLIP_MAX_SLOTS];
++static unsigned int gXgFlipSlots;
++static unsigned long long gXgFlipBytes;
++
++static struct i915_ggtt *
++xg_flip_ggtt(struct drm_i915_private **i915p)
++{
++	struct drm_i915_private *i915 = xg_i915_dev();
++
++	if (i915 == NULL)
++		return (NULL);
++	*i915p = i915;
++	return (to_gt(i915)->ggtt);
++}
++
++/* reserve `slots` GGTT slots of `surface_bytes` each, below 4 GiB (PLANE_SURF is 32-bit); 0 or -errno */
++int
++xg_flip_init(unsigned long long surface_bytes, unsigned int slots, unsigned long long *ggtt_out,
++    unsigned int *count_out)
++{
++	struct i915_ggtt *ggtt;
++	struct drm_i915_private *i915;
++	unsigned long long size;
++	unsigned int i, done = 0;
++	int err = 0;
++
++	if (ggtt_out == NULL || count_out == NULL || surface_bytes == 0)
++		return (-EINVAL);
++	if ((ggtt = xg_flip_ggtt(&i915)) == NULL)
++		return (-ENODEV);
++	size = round_up(surface_bytes, I915_GTT_PAGE_SIZE);
++	if (gXgFlipSlots != 0 && gXgFlipBytes >= size) {	/* already reserved, large enough */
++		for (i = 0; i < gXgFlipSlots; i++)
++			ggtt_out[i] = gXgFlipNode[i].start;
++		*count_out = gXgFlipSlots;
++		return (0);
++	}
++	if (slots > XG_FLIP_MAX_SLOTS)
++		slots = XG_FLIP_MAX_SLOTS;
++	mutex_lock(&ggtt->vm.mutex);
++	for (i = 0; i < slots; i++) {
++		err = i915_gem_gtt_insert(&ggtt->vm, NULL, &gXgFlipNode[i], size, I915_GTT_PAGE_SIZE,
++		    I915_COLOR_UNEVICTABLE, 0x80000000ULL, 0x100000000ULL, PIN_NOEVICT);
++		if (err)
++			break;
++		ggtt_out[i] = gXgFlipNode[i].start;
++		done++;
++	}
++	mutex_unlock(&ggtt->vm.mutex);
++	if (done == 0)
++		return (err != 0 ? err : -ENOSPC);
++	gXgFlipSlots = done;
++	gXgFlipBytes = size;
++	*count_out = done;
++	return (0);
++}
++
++/* point slot's PTEs at these physical pages (4 KiB each), then one TLB invalidate for the whole slot */
++int
++xg_flip_map(unsigned int slot, unsigned long long surface_bytes, const unsigned long long *phys,
++    unsigned int npages)
++{
++	struct i915_ggtt *ggtt;
++	struct drm_i915_private *i915;
++	unsigned long long size;
++	unsigned int i, need;
++	unsigned int pat;
++
++	if (slot >= gXgFlipSlots || phys == NULL || surface_bytes == 0)
++		return (-EINVAL);
++	if ((ggtt = xg_flip_ggtt(&i915)) == NULL)
++		return (-ENODEV);
++	size = round_up(surface_bytes, I915_GTT_PAGE_SIZE);
++	need = (unsigned int)(size >> 12);
++	if (npages < need)
++		return (-EINVAL);
++	/* system-memory scanout: uncached, which on this platform encodes as a plain phys|PRESENT PTE */
++	pat = i915_gem_get_pat_index(i915, I915_CACHE_NONE);
++	for (i = 0; i < need; i++) {
++		u64 pte = ggtt->vm.pte_encode((dma_addr_t)(phys[i] & ~0xfffull), pat, 0);
++		writeq(pte, (u64 __iomem *)ggtt->gsm + (gXgFlipNode[slot].start >> 12) + i);
++	}
++	ggtt->invalidate(ggtt);
++	return (0);
++}
++
++/* drop the slot's PTEs back to scratch, then one TLB invalidate (clear_range is a no-op on gen8+) */
++int
++xg_flip_unmap(unsigned int slot, unsigned long long surface_bytes)
++{
++	struct i915_ggtt *ggtt;
++	struct drm_i915_private *i915;
++	unsigned long long size;
++
++	if (slot >= gXgFlipSlots || surface_bytes == 0)
++		return (-EINVAL);
++	if ((ggtt = xg_flip_ggtt(&i915)) == NULL)
++		return (-ENODEV);
++	size = round_up(surface_bytes, I915_GTT_PAGE_SIZE);
++	if (ggtt->vm.scratch_range != NULL)
++		ggtt->vm.scratch_range(&ggtt->vm, gXgFlipNode[slot].start, size);
++	ggtt->invalidate(ggtt);
++	return (0);
++}
