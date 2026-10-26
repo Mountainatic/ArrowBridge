@@ -45,6 +45,8 @@ patch -p1 < /path/to/patches/0007-plugin-first-loss-journal.patch
 
 `0005` 里 `plugin/NVMTLDevice.m` 被删除、`plugin/XeMTLDevice.m` 被加入，因此应用时带 `--remove-empty-files` 更干净。
 
+两套补丁的基点互不通用：`0001–0004`、`0008–0010` 针对 0.0.44 树，`0005–0007` 针对 0.0.35 的 `plugin/` 目录。把插件补丁叠到 0.0.44 树上时，`0006` 会因为上下文差异出现部分 hunk 失败，这属于基点混用而不是补丁本身的问题；在 0.0.35 树上重放 `0005 → 0006 → 0007` 三个补丁全部 `OK`（最终 `plugin/` 33 个文件，`nvmtl_range_writable` 标记存在）。
+
 ## 验证方式
 
 项目在生成补丁时对每个补丁做了两向验证：
