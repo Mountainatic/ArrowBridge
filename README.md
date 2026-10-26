@@ -1,6 +1,6 @@
 # ArrowBridge
 
-**ArrowBridge** 是面向 Intel Arrow Lake-HX Xe-LPG 核显的 macOS 图形与内屏接管实验项目。当前实机为 Intel Core Ultra 9 275HX，核显设备号为 `8086:7D67`，系统为 macOS Tahoe 26.7.1。项目已经打通 XeGfx 内核驱动、ANV Vulkan、XeMTL Metal、WindowServer 桌面合成与内屏显示链路，并把工作重点推进到刷新节拍、原生翻页、硬件光标与电源管理。
+**ArrowBridge** 是面向 Intel Arrow Lake-HX Xe-LPG 核显的 macOS 图形与内屏接管实验项目。当前实机为 Intel Core Ultra 9 275HX，核显设备号为 `8086:7D67`，系统为 macOS Tahoe 26.7.1。项目已经打通 XeGfx 内核驱动、ANV Vulkan、XeMTL Metal、WindowServer 桌面合成与内屏显示链路，并把显示提交推进到 GGTT 槽零拷贝 flip。后续工作继续围绕系统刷新节拍、HiDPI、硬件光标与电源管理展开。
 
 项目以单机实测为边界。仓库保存经过验证的补丁、安装脚本、试验脚本与技术记录，上游源码从对应项目获取。同机 OpenCore 配置见 [YaoShi16-Ultra-OpenCore-efi](https://github.com/Mountainatic/YaoShi16-Ultra-OpenCore-efi)。
 
@@ -32,21 +32,27 @@
 
    使用 NvGfx xe 分支中的 XeGfxAccel 与 NMXAccel 结构，把 Intel 内屏注册为 head 4，并向 WindowServer 提供 IOKit 图形通道。WindowServer 的 Metal 合成结果由此进入 `IOAccelDisplayPipeTransaction2`。
 
-6. **XeGfxIntelFB 发布真实面板信息**
+6. **XeGfxIntelFB 发布面板时序与 HiDPI 模式**
 
    使用 NvGfx xe 分支中的 `XeGfxIntelFB` 模块读取 BAR0 显示寄存器和帧计数器，取得真实面板时序。当前实测模式为 2560x1600，像素时钟 276871248 Hz，扫描频率 59.877 Hz。
 
-   ArrowBridge 在这一层补充 mode information 与 detailed timing，使 CoreDisplay 能够获得面板真实参数。
+   ArrowBridge 在这一层发布 `IOFBDetailedTimings`，并补充 mode information 与 detailed timing。补丁同时加入 1280x800 HiDPI 桌面模式，底层 raster 继续保持 2560x1600，WindowServer 使用 2x backing 完成缩放。
 
 7. **NVRMAGDC 打开 IOPresentment 显示事务**
 
    使用 NvGfx xe 分支中的 `NVRMAGDC` 模块回答 K5 link-config 命令 `0x921`，把 XeGfxIntelFB 测得的 timing 交给显示控制链。AGDC 完成握手后，IOPresentment 开始向 head 4 发送 display-pipe transaction。
 
-8. **display-pipe 把 WindowServer 帧送到真实内屏**
+8. **XeGfx core 为合成帧建立 GGTT 零拷贝槽**
 
-   WindowServer 先把一帧合成到 IOSurface。XeGfxAccel 收到 display-pipe transaction 后等待下一次 vblank，再把这一帧写入 firmware framebuffer aperture。显示引擎持续扫描同一块 aperture，新的桌面内容随后进入内屏。
+   ArrowBridge 在 XeGfx core 中加入 `xgFlipInit`、`xgFlipMap` 与 `xgFlipUnmap`。core 使用 i915 的全局 GGTT 预留三个槽，每个槽覆盖一帧 2560x1600 XRGB surface。槽使用 `I915_COLOR_UNEVICTABLE` 保持地址稳定，首次实测落在 `0x80000000` 开始的 GGTT 区域。
 
-   当前这条路径仍使用每帧约 16 MB 的 CPU copy。连续 present 已经验证完成，下一步正在推进零拷贝，让显示引擎直接扫描 surface backing，把整帧 CPU copy 从主路径中移走。
+   WindowServer 交来的 IOSurface 位于系统内存。XeGfxAccel 通过 `IOMemoryDescriptor` 取得物理页，再经 XeGfxResident 的 platform function 桥把这些物理页写入对应 GGTT 槽的 PTE。
+
+9. **display-pipe 直接 flip 到 surface backing**
+
+   XeGfxAccel 完成新帧的 GGTT 映射后，把槽的 GGTT 偏移写入 `PLANE_SURF_1_A`。显示引擎在下一次 vblank 锁存新的 surface，并直接扫描 WindowServer 合成帧。
+
+   三个槽按帧轮转。当前帧与前两帧持续保留映射，后续 flip 确认旧槽退出扫描后再回收。CPU copy 保留为故障回退路径，`debug.xegfxaccel_iop_xe_flip=0` 可以在运行时切回拷贝提交。
 
 ## 推进过程中解决的问题
 
@@ -72,7 +78,7 @@ WindowServer 会交给 XeMTL 一部分只读 host mapping。早期插件直接�
 
 ArrowBridge 在 `0006-plugin-host-import.patch` 中加入 `nvmtl_range_writable` 判定。可写范围继续使用 host import，其余范围进入 copy path。这样让 userptr 权限与实际 VMA 权限保持一致。
 
-修正后，连续桌面试验跨越多次启动保持稳定，原来的 execbuffer EFAULT 与 device lost 主链已经消失。
+修正后，连续桌面试验跨越多次启动保持稳定，execbuffer EFAULT 与 device lost 主链已经消失。
 
 ### 3. display-pipe 事务需要完整的显示握手
 
@@ -94,17 +100,34 @@ ArrowBridge 在 `0002-accel-vblank-and-head4.patch` 中注册 head 4，并把 pr
 
 面板寄存器和帧计数器给出的真实扫描频率为 59.877 Hz，而 CoreDisplay 早期读取到的 mode refresh 为 0，CVDisplayLink 则按 30 Hz 推进。
 
-ArrowBridge 先从 BAR0 读取 live timing，再由 XeGfxIntelFB 补充 `getInformationForDisplayMode` 与 `getTimingInfoForDisplayMode`。同一份 timing 同时进入 framebuffer mode information 与 AGDC K5 回答。
+ArrowBridge 先从 BAR0 读取 live timing，再由 XeGfxIntelFB 补充 `getInformationForDisplayMode` 与 `getTimingInfoForDisplayMode`。随后 `0010-intelfb-detailed-timings.patch` 把同一份 timing 发布到 `IOFBDetailedTimings`，并增加 1280x800 HiDPI 模式。原生模式与 HiDPI 模式共享 2560x1600 raster，面板扫描参数保持一致。
 
-当前这一步已经完成代码接入，最新 kext 的运行时验证正在继续。目标是让 CGDisplayMode 与 CVDisplayLink 都收敛到面板真实节拍。
+这一步已经进入最新 framebuffer 补丁，后续验证继续观察 CGDisplayMode、CVDisplayLink 与模式列表是否全部收敛到真实面板节拍。
 
-### 5. 每帧 16 MB copy 的性能边界已经量化
+### 5. 整帧 CPU copy 推进到 GGTT 零拷贝 flip
 
-当前 display-pipe 使用 IOSurface 到 framebuffer aperture 的整帧 copy。2560x1600 XRGB 一帧为 16384000 字节。
+早期 display-pipe 会把每个 2560x1600 XRGB surface 整帧复制到 firmware framebuffer。单帧数据量为 16384000 字节，常规 copy 耗时约 1.3 到 2.3 ms，峰值曾达到 19 到 60 ms。峰值跨越 vblank 时会带来撕裂，同时每帧 16 MB 写流量持续占用 CPU 与内存带宽。
 
-实测平均 copy 耗时约 2.26 ms，平均 transaction 耗时约 11.1 ms。桌面 present 频率主要受 WindowServer 合成节拍影响。当前一边继续修正 30 Hz timing 与 display link，一边推进零拷贝显示路径。
+ArrowBridge 在 `0008-core-ggtt-flip-slots.patch` 中让 XeGfx core 预留 GGTT 槽，并通过 `xgFlipInit`、`xgFlipMap` 与 `xgFlipUnmap` 管理槽的 PTE。随后 `0009-accel-zero-copy-flip.patch` 让 XeGfxAccel 取得 IOSurface 的物理页，映射到空闲槽，再把槽的 GGTT 偏移写入 `PLANE_SURF_1_A`。
 
-零拷贝路线的目标是让显示引擎直接扫描可见的 surface backing，并在 vblank 边界完成切换。这样可以把整帧 CPU copy 从主路径中移走，并把 display-pipe 从过渡搬运路径推进到真正的 surface 直出。
+帧生命周期由三槽轮转维护。新帧先完成映射，再提交 plane surface；当前帧与前两帧继续持有 backing，后续 flip 再回收最旧槽。映射失败、物理页获取失败或桥调用失败时，事务进入已经验证过的 CPU copy 回退路径。
+
+首次零拷贝验收运行 200 秒，记录：
+
+- `pipe_perform = 2837`
+- `iop_ok = 0`
+- `flip_miss = 0`
+- `flip_fail = 0`
+- kernel panic 计数为 0
+- DEVICE_LOST 计数为 0
+
+随后桌面继续稳定运行 30 分钟以上，撕裂现象也随整帧 copy 退出主路径而消失。
+
+### 6. 合成节拍瓶颈进一步收敛到 CA 到 Metal 编码路径
+
+零拷贝切换之后，display-pipe 的整帧搬运已经退出主路径。A/B 试验也验证了逐帧等待合成完成这一同步点对吞吐影响有限。
+
+现阶段帧率主要受 WindowServer 的 CoreAnimation 到 Metal 编码与翻译路径影响。刷新节拍与 detailed timing 继续补齐以后，可以在稳定零拷贝基线上进一步定位这一段的软件开销。
 
 ## 硬件与系统
 
@@ -130,25 +153,31 @@ ArrowBridge 先从 BAR0 读取 live timing，再由 XeGfxIntelFB 补充 `getInfo
 | `0005-plugin-xemtl-port.patch` | XeGfx 0.0.35 plugin | 把插件改编为 XeMTL |
 | `0006-plugin-host-import.patch` | XeMTL | 修正只读 host import |
 | `0007-plugin-first-loss-journal.patch` | XeMTL | 记录首个 submit 与 backend failure |
+| `0008-core-ggtt-flip-slots.patch` | XeGfx 0.0.44 | 预留 GGTT 零拷贝槽并开放 flip bridge |
+| `0009-accel-zero-copy-flip.patch` | 0002 之后 | 用 GGTT 槽完成零拷贝 display flip |
+| `0010-intelfb-detailed-timings.patch` | 0003 之后 | 发布 IOFBDetailedTimings 与 1280x800 HiDPI 模式 |
 
 补丁的应用顺序与基点提交见 [patches/README.md](patches/README.md)。
 
 ## 构建与试验
 
 1. 克隆 [watchthelight-labs/NvGfx 的 xe 分支](https://github.com/watchthelight-labs/NvGfx/tree/xe)。
-2. core 检出 `5a19a73f`，依次应用 `0001` 到 `0004`。
-3. plugin 检出 `497d521e`，依次应用 `0005` 到 `0007`。
-4. 使用 `build/nvgfx/build_xegfx.sh` 构建 XeGfx core。
-5. 使用对应构建入口生成 XeGfxAccel、XeGfxIntelFB、NVRMAGDC 与 XeMTL。
-6. 使用 `scripts/install_core_044.py`、`install_upstream_accel.py` 与 `install_xeintelfb.py` 安装并重建 AuxKC。
-7. 系统启动后运行 `scripts/run_upstream_trial4.sh`，按阶段加载 core、打开 head 4、启动 display-pipe、重启一次 WindowServer 并采集遥测。
-8. 使用 `scripts/soak_userptr_test.sh` 做 userptr 长压测，使用 `scripts/tools/display_probe.c` 检查刷新节拍。
+2. core 检出 `5a19a73f`，先应用 `0001` 到 `0004`。
+3. 在同一 core 树继续应用 `0008`、`0009` 与 `0010`，补入 GGTT flip 与 detailed timings。
+4. plugin 检出 `497d521e`，依次应用 `0005` 到 `0007`。
+5. 使用 `build/nvgfx/build_xegfx.sh` 构建 XeGfx core。
+6. 使用对应构建入口生成 XeGfxAccel、XeGfxIntelFB、NVRMAGDC 与 XeMTL。
+7. 使用 `scripts/install_core_044.py`、`install_upstream_accel.py` 与 `install_xeintelfb.py` 安装并重建 AuxKC。
+8. 系统启动后运行 `scripts/run_upstream_trial4.sh`，按阶段加载 core、打开 head 4、启动 display-pipe、重启一次 WindowServer 并采集遥测。
+9. 使用 `debug.xegfxaccel_iop_xe_flip=1` 进入 GGTT 零拷贝路径，并观察 `iop_xe_flips`、`iop_xe_flip_miss` 与 `iop_xe_flip_fail`。
+10. 使用 `scripts/soak_userptr_test.sh` 做 userptr 长压测，使用 `scripts/tools/display_probe.c` 检查刷新节拍。
 
 完整构建说明见 [docs/building.md](docs/building.md)。
 
 ## 文档
 
 - [显示接管路线](docs/route.md)
+- [零拷贝 GGTT flip](docs/zero-copy-flip.md)
 - [device lost 修正](docs/device-lost.md)
 - [userptr panic 修正](docs/userptr-panic.md)
 - [刷新率链路](docs/refresh.md)
@@ -158,8 +187,11 @@ ArrowBridge 先从 BAR0 读取 live timing，再由 XeGfxIntelFB 补充 `getInfo
 
 ## 安全回退
 
-显示接管直接操作真实 GPU 与内屏通路，因此试验流程保留三级回退。
+显示接管直接操作真实 GPU 与内屏通路，因此试验流程保留多级回退。
 
+- `debug.xegfxaccel_iop_xe_flip=0` 在运行时把显示提交切回 CPU copy
+- `-xeintelfbhidpi=0` 关闭新增的 1280x800 HiDPI 模式
+- `-xeintelfbdt=0` 关闭新增的 detailed timings 发布
 - `-xeintelfboff` 让 framebuffer 接管停留在固件路径
 - `xeintelfb-starts` 记录连续异常启动次数，并在达到阈值后让 probe 留在安全阶段
 - `debug.xegfxaccelfb=1` 作为 head 4 接管开关，重启后回到默认状态
