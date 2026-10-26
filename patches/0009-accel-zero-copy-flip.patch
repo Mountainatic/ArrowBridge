@@ -1,0 +1,303 @@
+# 0009 accel: zero-copy display flip through the GGTT slots, with the copy path kept as a fallback
+#
+# Base:  NvGfx xe 5a19a73f36249efb99c44c3f9cb34603ef0c0eb8 (XeGfx 0.0.44)
+# Requires: patches/0002-accel-vblank-and-head4.patch
+# Files: kexts/NVRM/accel/nvrm-accel.cpp (modified)
+#        kexts/NVRM/accel/xegfx_accel_names.h (modified: sysctl-visible names for the new counters)
+# Apply: patch -p1 < patches/0009-accel-zero-copy-flip.patch
+#
+# The copy path costs a 16 MB CPU copy per frame.  With the frame's physical pages known (surface
+# IOMemoryDescriptor) and XeGfx's GGTT slots available, the tx path now maps the frame into a free slot,
+# writes PLANE_SURF_1_A once (the plane arms it at the next vblank), and keeps the two previous frames
+# mapped until a later flip proves they are no longer scanned.  debug.xegfxaccel_iop_xe_flip=0 falls back
+# to the copy path at any time.  The counters that made the diagnosis possible are kept: surf_repeat /
+# same_refresh / copy_overrun / copy_cross / src_changed and the surface-map timings; the rest is the flip
+# state machine and its sysctl registrations.
+#
+--- a/kexts/NVRM/accel/nvrm-accel.cpp
++++ b/kexts/NVRM/accel/nvrm-accel.cpp
+@@ -210,7 +210,7 @@
+                             OSObject *, void *) APPLE_KEXT_OVERRIDE {
+         static IOService *res;
+         if (sel != 0 || a->scalarInputCount != 3 || a->scalarOutputCount != 1) return kIOReturnBadArgument;
+-        if (!res) { OSDictionary *m = serviceMatching("XeGfxResident"); if (m) res = waitForMatchingService(m, 1000ULL * 1000 * 1000); }
++        if (!res) { OSDictionary *m = IOService::serviceMatching("XeGfxResident"); if (m) res = waitForMatchingService(m, 1000ULL * 1000 * 1000); }
+         if (!res) return kIOReturnNotAttached;
+         int err = EIO;
+         const OSSymbol *fn = OSSymbol::withCStringNoCopy("xgDrmIoctl");
+@@ -1107,6 +1107,11 @@
+ static int    gNvIop = 0;
+ static SInt64 gCntIopOk, gCntIopFail, gCntIopEmpty, gCntIopSrcRes, gCntIopSrcSurf, gCntIopBlank;
+ static SInt64 gCntIopOkHead[kNvMaxFB];
++static SInt64 gCntIopSurfRepeat, gCntIopSameRefresh, gCntIopCopyOverrun;
++static unsigned int gIopLastSurf;          /* last surface id presented */
++static unsigned int gIopLastFrameAtCopy;   /* display frame counter when the last copy started */
++static SInt64 gCntIopCopyCross, gCntIopSrcChanged;
++static SInt64 gIopMapLastUs, gIopMapMaxUs, gIopMapSumUs;
+ 
+ // the display-pipe copy path's per-frame cost: the copy itself, the whole transaction, and the gap between
+ // transactions, all in us.  The transaction runs on WindowServer's display thread, so txn is WindowServer's frame time.
+@@ -1124,6 +1129,22 @@
+ static SInt64 gCntIopVblankWaits, gCntIopVblankSkips, gIopVblankLastUs, gIopVblankMaxUs;
+ #define NV_DISP_FRAME_COUNTER 0x70040u
+ 
++// --- Intel zero-copy flip: the compositor's frame is already in system memory.  Instead of copying it into the
++// boot framebuffer, reserved GGTT slots (XeGfx owns the PTEs via xgFlipInit/xgFlipMap) are pointed at the frame's
++// own physical pages and PLANE_SURF_1_A is written once.  The plane latches the new offset at the next vblank, and
++// the front before last stays pinned until a later flip proves its slot is no longer scanned.
++static int gIopXeFlip = 0;
++static IOService *gXeFlipSvc;
++static unsigned long long gXeFlipGgtt[8];
++static unsigned int gXeFlipSlots, gXeFlipNext;
++static unsigned long long gXeFlipBytes;
++static unsigned int gXeFlipLive = ~0u;
++static IOMemoryDescriptor *gXeFlipFrontMd, *gXeFlipPrevMd;
++static IOSurface *gXeFlipFront, *gXeFlipPrev;
++static SInt64 gCntXeFlip, gCntXeFlipMiss, gCntXeFlipFail;
++#define NV_PLANE_SURF_A 0x7019cu
++#define NV_XE_FLIP_MAX_PAGES 4224
++
+ extern "C" void absolutetime_to_nanoseconds(uint64_t abstime, uint64_t *result);
+ static inline SInt64 nvIopUsBetween(uint64_t t0, uint64_t t1)
+ {
+@@ -1154,6 +1175,92 @@
+     OSAddAtomic64(1, &gCntIopVblankWaits);
+     gIopVblankLastUs = us;
+     if (us > gIopVblankMaxUs) gIopVblankMaxUs = us;
++}
++static IOService *nvAccelResident(void)
++{
++    if (!gXeFlipSvc) {
++        OSDictionary *m = IOService::serviceMatching("XeGfxResident");
++        if (m) { gXeFlipSvc = IOService::waitForMatchingService(m, 1000ULL * 1000 * 1000); m->release(); }
++    }
++    return (gXeFlipSvc);
++}
++static IOReturn nvAccelResidentCall(const char *fn, void *p1, void *p2, void *p3, void *p4)
++{
++    IOService *svc = nvAccelResident();
++    if (!svc) return (kIOReturnNotAttached);
++    const OSSymbol *sym = OSSymbol::withCStringNoCopy(fn);
++    if (!sym) return (kIOReturnNoMemory);
++    IOReturn r = svc->callPlatformFunction(sym, false, p1, p2, p3, p4);
++    sym->release();
++    return (r);
++}
++static void nvAccelXeFlipDrop(IOSurface **s)
++{
++    /* getMemoryDescriptor() returns an unretained descriptor: never release it.
++       Only the IOSurface is retained (it keeps the frame memory alive while the
++       display engine may still be scanning it). */
++    if (*s) { ((OSObject *)*s)->release(); *s = nullptr; }
++}
++static bool nvAccelXeFlip(IOService *fb, unsigned head, IOSurface *s, unsigned w, unsigned h, unsigned pitch)
++{
++    if (!gIopXeFlip || !gDispMmio || !s || head != 4) return (false);
++    const unsigned long long bytes = (unsigned long long)pitch * (unsigned long long)h;
++    if (bytes == 0 || bytes > 64ull * 1024 * 1024) return (false);
++    if (!gXeFlipSlots) {
++        unsigned int n = 0;
++        if (nvAccelResidentCall("xgFlipInit", (void *)(uintptr_t)bytes, (void *)(uintptr_t)3,
++                gXeFlipGgtt, &n) != kIOReturnSuccess || n == 0) {
++            OSAddAtomic64(1, &gCntXeFlipFail);
++            return (false);
++        }
++        gXeFlipSlots = n; gXeFlipBytes = bytes; gXeFlipNext = 0;
++        ALOG("iop: zero-copy flip: %u GGTT slots x %llu bytes (first 0x%llx)", n, bytes, gXeFlipGgtt[0]);
++    }
++    unsigned int slot = gXeFlipNext % gXeFlipSlots;
++    for (unsigned int i = 0; i < gXeFlipSlots; i++) {
++        slot = (gXeFlipNext + i) % gXeFlipSlots;
++        if (slot != gXeFlipLive) break;
++    }
++    if (slot == gXeFlipLive) { OSAddAtomic64(1, &gCntXeFlipMiss); return (false); }
++    IOMemoryDescriptor *md = s->getMemoryDescriptor();
++    if (!md || md->getLength() < bytes) { OSAddAtomic64(1, &gCntXeFlipFail); return (false); }
++    if (md->prepare(kIODirectionNone) != kIOReturnSuccess) { OSAddAtomic64(1, &gCntXeFlipFail); return (false); }
++    static unsigned long long phys[NV_XE_FLIP_MAX_PAGES];
++    const unsigned int need = (unsigned int)((bytes + 4095ull) >> 12);
++    unsigned int npages = 0;
++    IOByteCount off = 0;
++    while (off < (IOByteCount)bytes && npages < need) {
++        IOByteCount segLen = 0;
++        addr64_t pa = md->getPhysicalSegment(off, &segLen, kIOMemoryMapperNone);
++        if (!pa || !segLen) break;
++        IOByteCount remain = (IOByteCount)bytes - off;
++        for (IOByteCount q = 0; q < segLen && npages < need && q < remain; q += 4096)
++            phys[npages++] = ((unsigned long long)pa + q) & ~0xfffull;
++        off += segLen;
++    }
++    const IOReturn mapRc = (npages < need) ? kIOReturnNoSpace :
++        nvAccelResidentCall("xgFlipMap", (void *)(uintptr_t)slot, phys, (void *)(uintptr_t)npages,
++            (void *)(uintptr_t)bytes);
++    md->complete(kIODirectionNone);	/* pages are in the GGTT now; do not keep the descriptor */
++    md = nullptr;
++    if (mapRc != kIOReturnSuccess) {
++        OSAddAtomic64(1, &gCntXeFlipFail);
++        return (false);
++    }
++    const uint32_t f0 = gDispMmio[NV_DISP_FRAME_COUNTER / 4];
++    gDispMmio[NV_PLANE_SURF_A / 4] = (uint32_t)gXeFlipGgtt[slot];	/* the arming write */
++    const uint64_t t0 = mach_absolute_time();
++    bool latched = false;
++    while (nvIopUsBetween(t0, mach_absolute_time()) < 25000) {
++        if (gDispMmio[NV_DISP_FRAME_COUNTER / 4] != f0) { latched = true; break; }
++        IOSleep(1);
++    }
++    nvAccelXeFlipDrop(&gXeFlipPrev);
++    gXeFlipPrev = gXeFlipFront;
++    gXeFlipFront = s; ((OSObject *)s)->retain();
++    gXeFlipLive = slot; gXeFlipNext = slot + 1;
++    if (latched) OSAddAtomic64(1, &gCntXeFlip); else OSAddAtomic64(1, &gCntXeFlipFail);
++    return (latched);
+ }
+ #define NVIOP_LOG_MAX 40
+ static unsigned gIopLogs = 0;
+@@ -1173,6 +1280,8 @@
+ void NVDisplayPipe::free()
+ {
+     iopDropSources();
++    nvAccelXeFlipDrop(&gXeFlipPrev);
++    nvAccelXeFlipDrop(&gXeFlipFront);
+     IOAccelLegacyDisplayPipe::free();
+ }
+ 
+@@ -1274,7 +1383,9 @@
+         if (P < 4 * W || (P & 3)) NVIOP_FAIL(kIOReturnBadArgument, "surface %llux%llu: row pitch %llu is under 4*W or not word-aligned", W, H, P);
+         IOMemoryDescriptor *md = s->getMemoryDescriptor();
+         if (!md) NVIOP_FAIL(kIOReturnNoMemory, "surface 0x%x has no memory descriptor", s->getSurfaceID());
++        const uint64_t mapStart = mach_absolute_time();
+         src = (const volatile unsigned int *)iopMapSurface(s->getSurfaceID(), md, H * P);
++        nvIopStat(&gIopMapLastUs, &gIopMapMaxUs, &gIopMapSumUs, nvIopUsBetween(mapStart, mach_absolute_time()));
+         if (!src) NVIOP_FAIL(kIOReturnVMError, "surface 0x%x would not prepare/map %llu bytes", s->getSurfaceID(), H * P);
+         w = (unsigned)W; h = (unsigned)H; pitch = (unsigned)P;
+     } else {
+@@ -1289,10 +1400,30 @@
+     if (ret != kIOReturnSuccess || !q.kva || q.pitch < 4 || !q.height) NVIOP_FAIL(kIOReturnNotReady, "framebuffer would not describe its scanout (0x%x kva %p pitch %u)", (unsigned)ret, q.kva, q.pitch);
+     if (w != q.width || h != q.height) NVIOP_FAIL(kIOReturnBadArgument, "source %ux%u is not the scanout's %ux%u", w, h, q.width, q.height);
+ 
++    if (gIopXeFlip && s && nvAccelXeFlip(fb, head, s, w, h, pitch)) {
++        nvAccelIopHome(fb, head);
++        nvIopStat(&gIopTxnLastUs, &gIopTxnMaxUs, &gIopTxnSumUs, nvIopUsBetween(txnStart, mach_absolute_time()));
++        gIopLastTxnEnd = mach_absolute_time();
++        return kIOReturnSuccess;
++    }
++
+     nvAccelIopHome(fb, head);
+     nvAccelIopWaitVblank();
++    const unsigned int surfID = s ? (unsigned)s->getSurfaceID() : 0u;
++    const unsigned int frameNow = gDispMmio ? gDispMmio[NV_DISP_FRAME_COUNTER / 4] : 0u;
++    if (gIopLastSurf && surfID == gIopLastSurf) OSAddAtomic64(1, &gCntIopSurfRepeat);
++    if (gIopLastFrameAtCopy && frameNow == gIopLastFrameAtCopy) OSAddAtomic64(1, &gCntIopSameRefresh);
++    gIopLastSurf = surfID;
++    gIopLastFrameAtCopy = frameNow;
+     const unsigned words = (((pitch < q.pitch) ? pitch : q.pitch) & ~3u) / 4;
+     const unsigned spr = pitch / 4, dpr = q.pitch / 4;
++    unsigned preSample[4] = {};
++    if (src) {
++        preSample[0] = src[0];
++        preSample[1] = src[(unsigned long)(h / 2) * spr + (spr / 2)];
++        preSample[2] = src[(unsigned long)(h - 1) * spr + (spr - 1)];
++        preSample[3] = src[(unsigned long)(h / 4) * spr];
++    }
+     const uint64_t copyStart = mach_absolute_time();
+     if (gIopMemcpy) {
+         if (q.pitch == pitch) {
+@@ -1311,6 +1442,23 @@
+         }
+     }
+     nvIopStat(&gIopCopyLastUs, &gIopCopyMaxUs, &gIopCopySumUs, nvIopUsBetween(copyStart, mach_absolute_time()));
++    if (gIopCopyLastUs > 12000) OSAddAtomic64(1, &gCntIopCopyOverrun);
++    {
++        const unsigned int frameEnd = gDispMmio ? gDispMmio[NV_DISP_FRAME_COUNTER / 4] : 0u;
++        if (frameNow && frameEnd && frameEnd != frameNow) OSAddAtomic64(1, &gCntIopCopyCross);
++        if (src) {
++            unsigned d = 0;
++            if (src[0] != preSample[0]) d++;
++            if (src[(unsigned long)(h / 2) * spr + (spr / 2)] != preSample[1]) d++;
++            if (src[(unsigned long)(h - 1) * spr + (spr - 1)] != preSample[2]) d++;
++            if (src[(unsigned long)(h / 4) * spr] != preSample[3]) d++;
++            if (d) OSAddAtomic64(1, &gCntIopSrcChanged);
++        }
++    }
++
++    { static SInt32 traceN; if ((traceN++ & 0x7f) == 0)
++        ALOG("iop: trace surf 0x%x frame %u copy %lld vblank %lld txn %lld",
++             surfID, frameNow, (long long)gIopCopyLastUs, (long long)gIopVblankLastUs, (long long)gIopTxnLastUs); }
+     OSAddAtomic64(1, fromRes ? &gCntIopSrcRes : &gCntIopSrcSurf);
+     const SInt64 n = OSAddAtomic64(1, &gCntIopOk);
+     const SInt64 nh = OSAddAtomic64(1, &gCntIopOkHead[head]);
+@@ -1405,6 +1553,16 @@
+ NVACCEL_CNT(nvaccel_iop_blank,        gCntIopBlank,       "K6: frames copied whose 64 samples were all ONE colour (a blank frame)");
+ static SInt64 gCntIopCopySkip;
+ NVACCEL_CNT(nvaccel_iop_copy_skip,    gCntIopCopySkip,    "frames kept on the panel because the surface's newest pixels were not yet in system memory");
++NVACCEL_CNT(nvaccel_iop_surf_repeat,  gCntIopSurfRepeat,  "K7: frames whose surface id repeats the previous frame (stale frame candidate)");
++NVACCEL_CNT(nvaccel_iop_same_refresh, gCntIopSameRefresh, "K7: frames whose copy started in the same display refresh as the previous frame");
++NVACCEL_CNT(nvaccel_iop_copy_overrun, gCntIopCopyOverrun, "K7: frame copies that took longer than 12 ms (tearing risk)");
++NVACCEL_CNT(nvaccel_iop_copy_cross,   gCntIopCopyCross,   "K7: copies that crossed a display refresh (tearing candidate)");
++NVACCEL_CNT(nvaccel_iop_src_changed,  gCntIopSrcChanged,  "K7: copies whose source pixels changed during the copy (concurrent render)");
++NVACCEL_CNT(nvaccel_iop_map_last_us,  gIopMapLastUs,      "K7: last source surface map time (us)");
++NVACCEL_CNT(nvaccel_iop_map_max_us,   gIopMapMaxUs,       "K7: worst source surface map time (us)");
++NVACCEL_CNT(nvaccel_iop_xe_flips,     gCntXeFlip,         "K8: frames flipped through reserved GGTT slots (zero copy, Intel panel)");
++NVACCEL_CNT(nvaccel_iop_xe_flip_miss, gCntXeFlipMiss,     "K8: flips skipped because the only free slot was the live one");
++NVACCEL_CNT(nvaccel_iop_xe_flip_fail, gCntXeFlipFail,     "K8: zero-copy flips that fell back to the CPU copy");
+ static int    gIopFlip = 0;
+ static SInt64 gCntIopFlip, gCntIopFlipHome, gCntIopFlipNo[8];
+ SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_flip, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, &gIopFlip, 0, "1 = scan the composited IOSurface out of its own VRAM (no copy)");
+@@ -1593,6 +1751,18 @@
+       sysctl_register_oid(&sysctl__debug_nvaccel_iop_vblank);          sysctl_register_oid(&sysctl__debug_nvaccel_iop_vblank_waits);
+       sysctl_register_oid(&sysctl__debug_nvaccel_iop_vblank_skips);    sysctl_register_oid(&sysctl__debug_nvaccel_iop_vblank_last_us);
+       sysctl_register_oid(&sysctl__debug_nvaccel_iop_vblank_max_us); }
++    { extern struct sysctl_oid sysctl__debug_nvaccel_iop_xe_flip, sysctl__debug_nvaccel_iop_xe_flip_miss,
++          sysctl__debug_nvaccel_iop_xe_flip_fail;
++      sysctl_register_oid(&sysctl__debug_nvaccel_iop_xe_flip);      sysctl_register_oid(&sysctl__debug_nvaccel_iop_xe_flip_miss);
++      sysctl_register_oid(&sysctl__debug_nvaccel_iop_xe_flip_fail); }
++    { extern struct sysctl_oid sysctl__debug_nvaccel_iop_surf_repeat, sysctl__debug_nvaccel_iop_same_refresh,
++          sysctl__debug_nvaccel_iop_copy_overrun, sysctl__debug_nvaccel_iop_copy_cross,
++          sysctl__debug_nvaccel_iop_src_changed, sysctl__debug_nvaccel_iop_map_last_us,
++          sysctl__debug_nvaccel_iop_map_max_us;
++      sysctl_register_oid(&sysctl__debug_nvaccel_iop_surf_repeat);  sysctl_register_oid(&sysctl__debug_nvaccel_iop_same_refresh);
++      sysctl_register_oid(&sysctl__debug_nvaccel_iop_copy_overrun); sysctl_register_oid(&sysctl__debug_nvaccel_iop_copy_cross);
++      sysctl_register_oid(&sysctl__debug_nvaccel_iop_src_changed);  sysctl_register_oid(&sysctl__debug_nvaccel_iop_map_last_us);
++      sysctl_register_oid(&sysctl__debug_nvaccel_iop_map_max_us); }
+     nvXeTraceStart();
+ #endif
+     sysctl_register_oid(&sysctl__debug_nvaccel_heads_published); sysctl_register_oid(&sysctl__debug_nvaccel_heads_registered);
+@@ -2572,6 +2742,8 @@
+            "1 = copy the frame with memcpy (default), 0 = the word-by-word loop");
+ SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_vblank, CTLFLAG_RW | CTLFLAG_LOCKED, &gIopVblank, 0,
+            "1 = copy each frame right after the panel's vblank (default), 0 = copy as soon as the transaction arrives");
++SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_xe_flip, CTLFLAG_RW | CTLFLAG_LOCKED, &gIopXeFlip, 0,
++    "1 = flip the compositor's own pages through reserved GGTT slots (zero copy), 0 = CPU copy (default)");
+ SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_iop_vblank_waits, CTLFLAG_RD | CTLFLAG_LOCKED, &gCntIopVblankWaits, "frames copied after a vblank wait");
+ SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_iop_vblank_skips, CTLFLAG_RD | CTLFLAG_LOCKED, &gCntIopVblankSkips, "frames copied without a vblank wait (no MMIO, gate off, or timeout)");
+ SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_iop_vblank_last_us, CTLFLAG_RD | CTLFLAG_LOCKED, &gIopVblankLastUs, "wait for the last vblank, us");
+--- a/kexts/NVRM/accel/xegfx_accel_names.h
++++ b/kexts/NVRM/accel/xegfx_accel_names.h
+@@ -167,4 +167,26 @@
+ #define nvaccel_iop_memcpy xegfxaccel_iop_memcpy
+ #define sysctl__debug_nvaccel_iop_memcpy sysctl__debug_xegfxaccel_iop_memcpy
+ #endif
++#define nvaccel_iop_surf_repeat xegfxaccel_iop_surf_repeat
++#define sysctl__debug_nvaccel_iop_surf_repeat sysctl__debug_xegfxaccel_iop_surf_repeat
++#define nvaccel_iop_same_refresh xegfxaccel_iop_same_refresh
++#define sysctl__debug_nvaccel_iop_same_refresh sysctl__debug_xegfxaccel_iop_same_refresh
++#define nvaccel_iop_copy_overrun xegfxaccel_iop_copy_overrun
++#define sysctl__debug_nvaccel_iop_copy_overrun sysctl__debug_xegfxaccel_iop_copy_overrun
++#define nvaccel_iop_copy_cross xegfxaccel_iop_copy_cross
++#define sysctl__debug_nvaccel_iop_copy_cross sysctl__debug_xegfxaccel_iop_copy_cross
++#define nvaccel_iop_src_changed xegfxaccel_iop_src_changed
++#define sysctl__debug_nvaccel_iop_src_changed sysctl__debug_xegfxaccel_iop_src_changed
++#define nvaccel_iop_map_last_us xegfxaccel_iop_map_last_us
++#define sysctl__debug_nvaccel_iop_map_last_us sysctl__debug_xegfxaccel_iop_map_last_us
++#define nvaccel_iop_map_max_us xegfxaccel_iop_map_max_us
++#define sysctl__debug_nvaccel_iop_map_max_us sysctl__debug_xegfxaccel_iop_map_max_us
++#define nvaccel_iop_xe_flip xegfxaccel_iop_xe_flip
++#define sysctl__debug_nvaccel_iop_xe_flip sysctl__debug_xegfxaccel_iop_xe_flip
++#define nvaccel_iop_xe_flips xegfxaccel_iop_xe_flips
++#define sysctl__debug_nvaccel_iop_xe_flips sysctl__debug_xegfxaccel_iop_xe_flips
++#define nvaccel_iop_xe_flip_miss xegfxaccel_iop_xe_flip_miss
++#define sysctl__debug_nvaccel_iop_xe_flip_miss sysctl__debug_xegfxaccel_iop_xe_flip_miss
++#define nvaccel_iop_xe_flip_fail xegfxaccel_iop_xe_flip_fail
++#define sysctl__debug_nvaccel_iop_xe_flip_fail sysctl__debug_xegfxaccel_iop_xe_flip_fail
+ #endif
