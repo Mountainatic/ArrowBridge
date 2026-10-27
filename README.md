@@ -1,12 +1,12 @@
 # ArrowWhatever
 
-**ArrowWhatever** 是面向 Intel Arrow Lake-HX Xe-LPG 核显的 macOS 图形与内屏接管实验项目。当前实机为 Intel Core Ultra 9 275HX，核显设备号为 `8086:7D67`，系统为 macOS Tahoe 26.7.1。项目已经打通 XeGfx 内核驱动、ANV Vulkan、XeMTL Metal、WindowServer 桌面合成与内屏显示链路，并把显示提交推进到 GGTT 槽零拷贝 flip；K9 延迟 flip 又把 GPU 完成与扫描面切换从 WindowServer 同步等待中解耦，在 2560x1600@60Hz 的当前面板上恢复到约 60fps 的加速桌面。当前工作重点继续围绕显示链稳定性、合成路径性能、HiDPI、硬件光标与电源管理展开。
+**ArrowWhatever** 是面向 Intel Arrow Lake-HX Xe-LPG 核显的 macOS 图形项目。关注于 Intel Core Ultra 9 275HX 的 Tohoe 适配，核显设备号为 `8086:7D67`，系统为 macOS Tahoe 26.7.1。目前整合 XeGfx 内核驱动、ANV Vulkan、XeMTL Metal、WindowServer 桌面合成与内屏显示链路，推进到 GGTT 槽零拷贝 flip，K9 延迟 flip 又把 GPU 完成与扫描面切换从 WindowServer 同步等待中解耦，在 2560x1600@60Hz 的当前面板上恢复到约 60fps 的加速桌面。
 
-项目以单机实测为边界。仓库保存经过验证的补丁、安装脚本、试验脚本与技术记录，上游源码从对应项目获取。同机 OpenCore 配置见 [YaoShi16-Ultra-OpenCore-efi](https://github.com/Mountainatic/YaoShi16-Ultra-OpenCore-efi)。
+仓库保存经过验证的补丁、安装脚本、试验脚本与技术记录，上游源码从对应项目获取。同机 OpenCore 配置见 [YaoShi16-Ultra-OpenCore-efi](https://github.com/Mountainatic/YaoShi16-Ultra-OpenCore-efi)。
 
 ## 启动方式与工作机制
 
-当前路线采用分阶段接管。系统先完整进入 macOS，再逐层启动 GPU、图形 API 与显示通路。每一层都有明确的上游来源与职责。
+当前驱动以依赖分阶段拉起。系统先完整进入 macOS，再逐层启动 GPU、图形 API 与显示通路，对于常规 EDID 识别与 framebuffer 启动的路径正在补全
 
 1. **OpenCore 先把系统带入可操作状态**
 
@@ -60,7 +60,7 @@
 
 ## 推进过程中解决的问题
 
-下面按照前面的链路顺序记录关键问题与修正。每一项都对应仓库中的一个补丁或一组验证脚本。
+下面按照前面的链路顺序记录关键问题与修正。
 
 ### 1. userptr 页释放竞态
 
@@ -74,7 +74,6 @@ xegfx: vm: freeing wired page 0x... ref 0x1
 
 ArrowWhatever 在 `0001-xg_vm-userptr-race.patch` 中把 userptr page hold 与末次 unwire 统一到同一套状态机，并加入私有 `XG_VPO_USERHOLD` 标记。最后一次 unwire 负责摘除 run 和释放页，page lifetime 因而保持单向收敛。
 
-修正后的 40 分 08 秒压力测试完成 527696 次 churn，创建和释放 1583088 个 IOSurface，`panic_hit = 0`，`reboot_hit = 0`。
 
 ### 2. 只读 host pointer 导致 device lost
 
@@ -88,17 +87,8 @@ ArrowWhatever 在 `0006-plugin-host-import.patch` 中加入 `nvmtl_range_writabl
 
 Metal 合成打通以后，下一步是让 WindowServer 的帧稳定进入 Intel 内屏。这里需要同时满足 framebuffer 发布、head 注册、AGDC link-config 与 IOPresentment transaction 四个条件。
 
-ArrowWhatever 在 `0002-accel-vblank-and-head4.patch` 中注册 head 4，并把 present 放到真实面板 vblank 之后。随后在 `0003-intelfb-panel-timing.patch` 中发布实时测得的面板 timing，再由 `0004-agdc-k5-panel-timing.patch` 回答 K5 link-config。
+ArrowWhatever 在 `0002-accel-vblank-and-head4.patch` 中注册 head 4，并把 present 放到真实面板 vblank 之后。随后在 `0003-intelfb-panel-timing.patch` 中发布实时测得的面板 timing，再由 `0004-agdc-k5-panel-timing.patch` 应答 K5 link-config。
 
-一次完整试验记录到：
-
-- `heads_published = 16`
-- `heads_registered = 16`
-- `heads_piped = 16`
-- `iop_ok_h4 = 2083`
-- `pipe_perform = 2083`
-
-这些计数全部落在 head 4，说明 WindowServer 到内屏的连续 present 链已经成立。
 
 ### 4. 系统刷新节拍与真实面板扫描频率分离
 
@@ -135,22 +125,17 @@ K9 把这个顺序约束移到内核侧：core 的 `xg_i915_idle()` 通过 `xgFl
 
 完整机制、sysctl 与手动 bring-up 流程见 [docs/k9-deferred-flip.md](docs/k9-deferred-flip.md)。
 
-### 7. XeMTL 性能观测与后续定位
-
-K9 之后，仓库里的插件补丁已经加入 no-wait 提交分支、逐调用 census 与首损日志，用来继续定位 WindowServer 的 CoreAnimation→Metal→ANV 编码开销。当前仓库只保存已经提交的 instrumentation 与可复现实验脚本；尚未合入仓库的本地原型、临时 benchmark 与开发中分支不在 README 中作为项目现状描述。
 
 ## 硬件与系统
 
 | 项目 | 取值 |
 | --- | --- |
 | 机型 | MECHREVO Yaoshi 16 Ultra |
-| CPU | Intel Core Ultra 9 275HX · Arrow Lake-HX |
-| 核显 | Intel Xe-LPG · 8086:7D67 |
+| CPU | Intel Core Ultra 9 275HX Arrow Lake-HX |
+| 核显 | Intel Xe-LPG: 8086:7D67 |
 | 独显 | NVIDIA GeForce RTX 5080 Laptop |
 | 内存 | 64 GB |
 | 系统 | macOS Tahoe 26.7.1 · 25G241 |
-| 内核 | Darwin 25.6.0 |
-| 内置屏 | 2560x1600 · 59.877 Hz 实测扫描 |
 
 ## 补丁结构
 
@@ -196,19 +181,6 @@ K9 之后，仓库里的插件补丁已经加入 no-wait 提交分支、逐调�
 - [K9 延迟 flip](docs/k9-deferred-flip.md)
 - [XeMTL 插件说明](docs/plugin.md)
 
-## 安全回退
-
-显示接管直接操作真实 GPU 与内屏通路，因此试验流程保留多级回退。
-
-- `debug.xegfxaccel_iop_xe_flip=0` 在运行时把显示提交切回 CPU copy
-- `debug.xegfxaccel_iop_xe_defer=0` 关闭 K9 延迟 flip，退回同步 flip
-- `-xeintelfbhidpi=0` 关闭新增的 1280x800 HiDPI 模式
-- `-xeintelfbdt=0` 关闭新增的 detailed timings 发布
-- `-xeintelfboff` 让 framebuffer 接管停留在固件路径
-- `xeintelfb-starts` 记录连续异常启动次数，并在达到阈值后让 probe 留在安全阶段
-- `debug.xegfxaccelfb=1` 作为 head 4 接管开关，重启后回到默认状态
-
-安装脚本会在 AuxKC 重建前保存现有文件，便于恢复上一套可启动配置。
 
 ## 许可与致谢
 
@@ -218,4 +190,4 @@ K9 之后，仓库里的插件补丁已经加入 no-wait 提交分支、逐调�
 
 驱动主体来自 NullMoth Systems 的 macOS Metal 驱动体系。ArrowWhatever 使用 [watchthelight-labs/NvGfx 的 xe 分支](https://github.com/watchthelight-labs/NvGfx/tree/xe) 与 [watchthelight-labs/XeGfx](https://github.com/watchthelight-labs/XeGfx)，并使用 Mesa ANV、metal2vulkan、FreeBSD drm-kmod 与 Intel GuC firmware。完整来源与署名见 [NOTICE.md](NOTICE.md)。
 
-ArrowWhatever 的适用范围以当前实机验证结果为准。
+ArrowWhatever 的适用范围以当前实机验证结果为准。项目主要由 LLM 驱动构建，自用代码不一定适用于所有情况。
