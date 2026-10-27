@@ -1,6 +1,6 @@
 # ArrowBridge
 
-**ArrowBridge** 是面向 Intel Arrow Lake-HX Xe-LPG 核显的 macOS 图形与内屏接管实验项目。当前实机为 Intel Core Ultra 9 275HX，核显设备号为 `8086:7D67`，系统为 macOS Tahoe 26.7.1。项目已经打通 XeGfx 内核驱动、ANV Vulkan、XeMTL Metal、WindowServer 桌面合成与内屏显示链路，并把显示提交推进到 GGTT 槽零拷贝 flip；K9 延迟 flip 又把 GPU 完成与扫描面切换从 WindowServer 同步等待中解耦，在 2560x1600@60Hz 的当前面板上恢复到约 60fps 的加速桌面。当前工作重点已经从“能否显示”转向两条主线：一条继续压缩 XeMTL→ANV 的 CPU 编码成本，另一条验证绕开 Vulkan API 的 Intel-native Metal backend。
+**ArrowBridge** 是面向 Intel Arrow Lake-HX Xe-LPG 核显的 macOS 图形与内屏接管实验项目。当前实机为 Intel Core Ultra 9 275HX，核显设备号为 `8086:7D67`，系统为 macOS Tahoe 26.7.1。项目已经打通 XeGfx 内核驱动、ANV Vulkan、XeMTL Metal、WindowServer 桌面合成与内屏显示链路，并把显示提交推进到 GGTT 槽零拷贝 flip；K9 延迟 flip 又把 GPU 完成与扫描面切换从 WindowServer 同步等待中解耦，在 2560x1600@60Hz 的当前面板上恢复到约 60fps 的加速桌面。当前工作重点继续围绕显示链稳定性、合成路径性能、HiDPI、硬件光标与电源管理展开。
 
 项目以单机实测为边界。仓库保存经过验证的补丁、安装脚本、试验脚本与技术记录，上游源码从对应项目获取。同机 OpenCore 配置见 [YaoShi16-Ultra-OpenCore-efi](https://github.com/Mountainatic/YaoShi16-Ultra-OpenCore-efi)。
 
@@ -135,44 +135,9 @@ K9 把这个顺序约束移到内核侧：core 的 `xg_i915_idle()` 通过 `xgFl
 
 完整机制、sysctl 与手动 bring-up 流程见 [docs/k9-deferred-flip.md](docs/k9-deferred-flip.md)。
 
-### 7. XDIFF 把剩余热点收敛到 Metal→Vulkan CPU 翻译
+### 7. XeMTL 性能观测与后续定位
 
-K9 之后，GPU wait、整帧 CPU copy、IOSurface host-import fallback 与 image churn 都已退出主要热点。XeMTL 的 XDIFF 计数器在安静的 60Hz 环境下得到下面一组 CPU 画像：
-
-| phase | fps | WindowServer CPU ms/帧 | draws/帧 | descriptor writes/帧 | new sets/帧 | 已计时插件四段 ms/帧 |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| light | 50.7 | 12.5 | 5.0 | 299 | 7.1 | 1.14 |
-| steady | 48.1 | 14.0 | 50.6 | 1843 | 53.8 | 2.85 |
-| churn | 50.4 | 11.3 | 25.8 | 1709 | 44.4 | 2.88 |
-| drag | 48.8 | 12.3 | 6.0 | 352 | 9.0 | 0.86 |
-| fullscreen | 50.2 | 12.9 | 48.0 | 1738 | 51.0 | 2.37 |
-
-同一套 XeMTL 前端在 NVIDIA/NVK 合成基准上的 steady draw 为 5.38 µs/draw，state churn 为 6.27 µs/draw；Intel/ANV 路径的重内容 phase 折算约 49–56 µs/draw。sampler 命中已经达到 92–99%，surface 请求只有 0.05–0.38 次/帧、image churn 只有 0.1–0.4 次/帧，说明 surface/import/cache 修复已经生效。
-
-目前最值得继续压缩的是 descriptor 生命周期与 Metal→Vulkan 状态翻译，而不是显示扫描或 GPU 算力。插件中已计时的四段只占约 0.9–2.9 ms/帧，WindowServer 仍有约 8–11 ms/帧落在 CoreAnimation、XeMTL 外层 glue 与 ANV command recording 之间。
-
-### 8. Intel-native Metal backend 实验
-
-为了判断这几十微秒的 per-draw CPU 成本究竟来自 Intel 硬件还是 Vulkan 适配层，项目已经启动一条独立的 Intel-native 实验路线。该路线保留 Mesa 的 Intel 硬件知识与编译器组件，但不把 Vulkan 作为 Metal 与 Xe-LPG 之间的中间协议：
-
-```text
-Metal/XeMTL state
-      ↓
-SPIR-V → NIR → Mesa intel/compiler → gen125 ISA
-      ↓
-ISL / genxml state encoding
-      ↓
-raw i915 EXECBUFFER2
-      ↓
-XeGfx → Xe-LPG
-```
-
-当前开发工作树已经完成两块地基，但尚未合入本仓库 main：
-
-- **M2 submit/memory harness**：直接使用 raw ioctl（不链接 libdrm）完成 GEM_CREATE、WC mmap、自管 48-bit softpin GPU VA、render/copy ring 提交、GEM_WAIT 与 GPU 写回验证。steady EXECBUFFER2 的 p50 约 14 µs，200 次连续小提交全部成功；单 batch 内 10,000 条 NOOP 的 submit + wait 约 92 µs，说明 M4 必须在一个 batch 内重复大量 draw 才能测到真实 per-draw CPU encode 成本。
-- **M3 minimal 3D state encoder**：已针对 `8086:7D67` / `verx10=125` 使用 `gen125_pack.h` 生成最小 3D command stream。host-side 自检已通过；solid color 为 40 条命令 / 193 dwords，textured 为 41 条 / 195 dwords。当前仍未向 GPU 提交 3D 命令，下一步等待 shader compiler 侧的 ISA + prog_data 后，先做纯色 quad readback，再做纹理 quad 与 M4 5 万 draw A/B。
-
-这条实验的判断标准很直接：如果 native backend 的 CPU encode 能接近裸 NVK/ANV 的约 5–6 µs/draw，而显著低于当前 XeMTL→ANV 的 23–56 µs/draw，就说明主要性能税来自 Metal→Vulkan 的对象与状态翻译；届时 ANV 可以继续保留为完整功能 fallback，而常见 CoreAnimation 路径逐步转到 Intel-native backend。
+K9 之后，仓库里的插件补丁已经加入 no-wait 提交分支、逐调用 census 与首损日志，用来继续定位 WindowServer 的 CoreAnimation→Metal→ANV 编码开销。当前仓库只保存已经提交的 instrumentation 与可复现实验脚本；尚未合入仓库的本地原型、临时 benchmark 与开发中分支不在 README 中作为项目现状描述。
 
 ## 硬件与系统
 
