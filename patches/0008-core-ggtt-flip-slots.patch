@@ -4,7 +4,7 @@
 # Requires: patches/0001-xg_vm-userptr-race.patch (touches the same tree, not these files)
 # Files: gpu/xegfx/shim/include/xg_i915.h (modified)
 #        gpu/xegfx/shim/src/xnu/xg_kext.cpp (modified)
-#        gpu/xkpi/src/i915/xg_i915_exec.c (modified: expose xg_i915_dev())
+#        gpu/xkpi/src/i915/xg_i915_exec.c (modified: expose xg_i915_dev() and xg_i915_idle())
 #        gpu/xkpi/src/i915/xg_i915_flip.c (new)
 # Apply: patch -p1 < patches/0008-core-ggtt-flip-slots.patch
 #
@@ -15,13 +15,19 @@
 # callPlatformFunction bridge: xgFlipInit / xgFlipMap / xgFlipUnmap.  xg_i915_dev() lets the other file reach
 # the i915_private that the driver-side KPI already looked up.  Slots are never freed; unmapping just points
 # the slot at a scratch page so nothing stale can be scanned out.
+# Later phase (K9): the flip is armed by the accelerator's deferred worker instead of synchronously, so the
+# core side also exposes the idle probe xg_i915_idle() through the same bridge ("xgFlipQuery"): 1 when every
+# engine finished the requests it was given, 0 while busy, -ENODEV without an i915 device.  It does not sleep.
 #
+
 --- a/gpu/xegfx/shim/include/xg_i915.h
 +++ b/gpu/xegfx/shim/include/xg_i915.h
-@@ -48,6 +48,13 @@
+@@ -48,6 +48,15 @@
  int xg_i915_store(struct xg_i915_store *sd, int timeout_ms);
  /* keep i915 off the GGTT range the boot surface scans out of (Hybrid, display disabled); 0 or a negative errno */
  int xg_i915_reserve_bootfb(unsigned long long offset, unsigned long long size);
++/* 1 when every uabi engine is idle, 0 busy, -ENODEV without an i915 device; does not sleep */
++int xg_i915_idle(void);
 +#define XG_FLIP_MAX_SLOTS	8
 +/* zero-copy scanout: reserve GGTT slots, then point one slot's PTEs at a frame's physical pages; 0 or -errno */
 +int xg_flip_init(unsigned long long surface_bytes, unsigned int slots, unsigned long long *ggtt_out,
@@ -34,7 +40,7 @@
  }
 --- a/gpu/xegfx/shim/src/xnu/xg_kext.cpp
 +++ b/gpu/xegfx/shim/src/xnu/xg_kext.cpp
-@@ -154,6 +154,23 @@
+@@ -154,6 +154,29 @@
  		*(int *)p4 = xg_fd_remote_ioctl((int)(uintptr_t)p1, (unsigned long)p2, (unsigned long long)(uintptr_t)p3);
  		return kIOReturnSuccess;
  	}
@@ -54,6 +60,12 @@
 +	if (name && name->isEqualTo("xgFlipUnmap")) {
 +		int err = xg_flip_unmap((unsigned int)(uintptr_t)p1, (unsigned long long)(uintptr_t)p2);
 +		return (err == 0 ? kIOReturnSuccess : kIOReturnError);
++	}
++	/* "xgFlipQuery" (int *idle out): 1 when the GPU finished everything it was given (0 busy, -ENODEV only when
++	 * no i915 device is bound); the accelerator's deferred flip worker polls this before it arms a frame. */
++	if (name && name->isEqualTo("xgFlipQuery") && p1) {
++		*(int *)p1 = xg_i915_idle();
++		return kIOReturnSuccess;
 +	}
  	/* "xgTrace" (const char *line): XeGfxAccel's state, stored with the console trace (thread context only) */
  	if (name && name->isEqualTo("xgTrace") && p1 && gLogLock) {
@@ -75,7 +87,37 @@
  int
  xg_i915_state(struct xg_i915_state *st)
  {
---- /dev/null
+@@ -193,3 +201,29 @@
+ 	mutex_unlock(&ggtt->vm.mutex);
+ 	return (err);
+ }
++
++/*
++ * Idle probe for the deferred display flip (K9): has everything the GPU was asked to do finished?  The
++ * accelerator's flip worker calls this through "xgFlipQuery" every millisecond before it points the plane at
++ * a frame, so a frame is only scanned out once the requests that wrote it are complete.  Thread context only,
++ * does not sleep: intel_engine_is_idle just looks at the request queues and the engine's PM state.
++ */
++int
++xg_i915_idle(void)
++{
++	struct pci_dev *pdev = NULL;
++	struct drm_i915_private *i915 = xg_i915_find(&pdev);
++	struct intel_gt *gt;
++	struct intel_engine_cs *engine;
++	int id;
++
++	if (!i915)
++		return (-ENODEV);
++	gt = to_gt(i915);
++	for (id = 0; id < I915_NUM_ENGINES; id++) {
++		engine = gt->engine[id];
++		if (engine && !intel_engine_is_idle(engine))
++			return (0);
++	}
++	return (1);
++}
+--- a/gpu/xkpi/src/i915/xg_i915_flip.c
 +++ b/gpu/xkpi/src/i915/xg_i915_flip.c
 @@ -0,0 +1,125 @@
 +// SPDX-License-Identifier: MIT

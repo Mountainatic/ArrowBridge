@@ -13,7 +13,12 @@
 # to the copy path at any time.  The counters that made the diagnosis possible are kept: surf_repeat /
 # same_refresh / copy_overrun / copy_cross / src_changed and the surface-map timings; the rest is the flip
 # state machine and its sysctl registrations.
+# K9 deferred mode: debug.xegfxaccel_iop_xe_defer=1 moves the flip off WindowServer's thread.  The frame is
+# mapped into its GGTT slot, a worker polls xgFlipQuery until the GPU is idle, and only then is PLANE_SURF_1_A
+# armed; wait_idle / report_busy / idle_ms tune the wait, and defer_armed / defer_signals / wait_max_us count
+# it.  This is what removed the 7.5-12.8 ms/frame commitAndWaitUntilSubmitted stall (15 -> 60 fps).
 #
+
 --- a/kexts/NVRM/accel/nvrm-accel.cpp
 +++ b/kexts/NVRM/accel/nvrm-accel.cpp
 @@ -210,7 +210,7 @@
@@ -37,10 +42,11 @@
  
  // the display-pipe copy path's per-frame cost: the copy itself, the whole transaction, and the gap between
  // transactions, all in us.  The transaction runs on WindowServer's display thread, so txn is WindowServer's frame time.
-@@ -1124,6 +1129,22 @@
+@@ -1123,7 +1128,66 @@
+ static int gIopVblank = 1;
  static SInt64 gCntIopVblankWaits, gCntIopVblankSkips, gIopVblankLastUs, gIopVblankMaxUs;
  #define NV_DISP_FRAME_COUNTER 0x70040u
- 
++
 +// --- Intel zero-copy flip: the compositor's frame is already in system memory.  Instead of copying it into the
 +// boot framebuffer, reserved GGTT slots (XeGfx owns the PTEs via xgFlipInit/xgFlipMap) are pointed at the frame's
 +// own physical pages and PLANE_SURF_1_A is written once.  The plane latches the new offset at the next vblank, and
@@ -56,11 +62,54 @@
 +static SInt64 gCntXeFlip, gCntXeFlipMiss, gCntXeFlipFail;
 +#define NV_PLANE_SURF_A 0x7019cu
 +#define NV_XE_FLIP_MAX_PAGES 4224
+ 
++// --- K9: deferred Intel zero-copy flip (plan 2, kernel-level ordering).  The no-wait compositor hands WindowServer's
++// frame to the display pipe as soon as its GPU work is submitted, so arming the plane here would scan out a frame that
++// is still being written: the symptoms are half-presented frames, tearing, the cursor jumping back and the input-
++// method box drawn wrong.  Instead the display thread only queues the frame, and a thread_call worker waits
++// until the GPU has finished everything it was given ("xgFlipQuery": every engine idle) before it maps the frame's
++// pages into a reserved GGTT slot and writes PLANE_SURF_1_A.  WindowServer itself never waits.  Frames are kept in a
++// small FIFO and every submitted frame is armed and its display transaction signalled in order, so WindowServer always
++// gets exactly one completion per frame it submitted.  While a frame is queued or in flight isTransactionComplete
++// reports the pipe busy, so WindowServer cannot recycle the frame's surface before it is on the panel.
++static int gIopXeDefer = 0;		// debug.xegfxaccel_iop_xe_defer: 1 = defer the plane write to the idle worker
++static int gIopXeWaitIdle = 1;		// debug.xegfxaccel_iop_xe_wait_idle: 0 = arm without waiting for GT idle
++static int gIopXeIdleMs = 40;		// debug.xegfxaccel_iop_xe_idle_ms: longest GT-idle wait, then arm anyway
++static int gIopXeReportBusy = 1;	// debug.xegfxaccel_iop_xe_report_busy: 0 = always report the transaction complete
++static SInt64 gCntXeDeferQueued, gCntXeDeferArmed, gCntXeDeferCoalesced, gCntXeDeferDropped;
++static SInt64 gCntXeDeferSignals, gCntXeDeferForced;
++static SInt64 gCntXeDeferIdleWait, gCntXeDeferIdleForced;
++static SInt64 gXeDeferIdleLastUs, gXeDeferIdleMaxUs, gXeDeferArmLastUs, gXeDeferArmMaxUs;
++static SInt64 gXeDeferQMaxDepth;
++/* The queue holds one entry per display transaction WindowServer handed over, so every transaction the worker
++   takes is also signalled - a transaction must never be left without a completion.  (The 2026-10-26 freeze was a
++   transaction whose arm had finished but whose busy flag stayed set across the signal: WindowServer woke on the
++   interrupt, asked isTransactionComplete before the worker cleared the flag, got "busy", and waited forever for a
++   second wakeup that never came - the display then went "not ready" and the watchdog killed WindowServer.)  The
++   busy flag is cleared *before* the signal now, and every queued frame gets its own signal.  An overflow (never
++   expected with a serialised display link) completes that transaction immediately instead of leaving it hanging. */
++#define NV_XE_FLIP_QUEUE 4
++struct NVXeFlipPend { void *pipe; IOSurface *s; unsigned w, h, pitch; };
++static NVXeFlipPend gXeFlipQ[NV_XE_FLIP_QUEUE];	// [head, tail) queued, protected by gXeFlipLock, owned reference in s
++static unsigned int gXeFlipQHead, gXeFlipQTail;
++static volatile SInt32 gXeFlipBusy;	// 1 while the worker is queued/running for at least one frame
++static SInt64 gXeFlipBusySince;		// mach_absolute_time() when busy went 0 -> 1 (stuck-worker escape hatch)
++static SInt64 gXeFlipGen;		// bumped when the display pipe goes away, so a stale worker does not arm
++static IOLock *gXeFlipLock;
++static struct thread_call *gXeFlipCall;
++static const OSSymbol *gXeFlipQuerySym;
++static int gXeFlipArmRun;		// consecutive deferred frames that did not reach the panel
++
++extern "C" {
++void _ZN18IOAccelDisplayPipe26signalTransactionInterruptEPv(void *pipe, void *arg);
++struct thread_call *thread_call_allocate(void (*func)(void *, void *), void *param0);
++int thread_call_enter(struct thread_call *call);
++}
 +
  extern "C" void absolutetime_to_nanoseconds(uint64_t abstime, uint64_t *result);
  static inline SInt64 nvIopUsBetween(uint64_t t0, uint64_t t1)
  {
-@@ -1154,6 +1175,92 @@
+@@ -1154,7 +1218,247 @@
      OSAddAtomic64(1, &gCntIopVblankWaits);
      gIopVblankLastUs = us;
      if (us > gIopVblankMaxUs) gIopVblankMaxUs = us;
@@ -90,9 +139,35 @@
 +       display engine may still be scanning it). */
 +    if (*s) { ((OSObject *)*s)->release(); *s = nullptr; }
 +}
-+static bool nvAccelXeFlip(IOService *fb, unsigned head, IOSurface *s, unsigned w, unsigned h, unsigned pitch)
++// 1 when the GPU finished everything it was given (the K9 ordering point), 0 on a timeout or with no i915 device.
++// Polls core's "xgFlipQuery" in 1 ms steps; *waitUs gets the time it took.  Thread context, sleeps.
++static int nvAccelXeFlipWaitIdle(SInt64 *waitUs)
 +{
-+    if (!gIopXeFlip || !gDispMmio || !s || head != 4) return (false);
++    const uint64_t t0 = mach_absolute_time();
++    int idle = -1;
++    *waitUs = 0;
++    if (!gIopXeWaitIdle) return (1);		// A/B switch: arm without ordering
++    IOService *svc = nvAccelResident();
++    if (!svc) return (0);
++    if (!gXeFlipQuerySym) gXeFlipQuerySym = OSSymbol::withCStringNoCopy("xgFlipQuery");
++    if (!gXeFlipQuerySym) return (0);
++    for (;;) {
++        idle = -1;
++        svc->callPlatformFunction(gXeFlipQuerySym, false, &idle, nullptr, nullptr, nullptr);
++        if (idle == 1 || idle < 0) break;
++        if (nvIopUsBetween(t0, mach_absolute_time()) >= (SInt64)gIopXeIdleMs * 1000) break;
++        IOSleep(1);
++    }
++    *waitUs = nvIopUsBetween(t0, mach_absolute_time());
++    if (idle == 1) OSAddAtomic64(1, &gCntXeDeferIdleWait);
++    return (idle == 1);
+ }
++// Arm one frame: point a free GGTT slot at the frame's pages, wait for GT idle when asked to (the K9 order), write
++// PLANE_SURF_1_A, and wait for the panel to latch it at a vblank (the frame before keeps scanning until then).  On
++// success the frame is on the panel and takes over the front/previous references; on failure the caller still owns it.
++static bool nvAccelXeFlipArm(IOSurface *s, unsigned w, unsigned h, unsigned pitch, bool waitIdle)
++{
++    if (!gDispMmio || !s) return (false);
 +    const unsigned long long bytes = (unsigned long long)pitch * (unsigned long long)h;
 +    if (bytes == 0 || bytes > 64ull * 1024 * 1024) return (false);
 +    if (!gXeFlipSlots) {
@@ -136,6 +211,11 @@
 +        OSAddAtomic64(1, &gCntXeFlipFail);
 +        return (false);
 +    }
++    if (waitIdle) {
++        SInt64 idleUs = 0;
++        if (!nvAccelXeFlipWaitIdle(&idleUs)) OSAddAtomic64(1, &gCntXeDeferIdleForced);
++        gXeDeferIdleLastUs = idleUs; if (idleUs > gXeDeferIdleMaxUs) gXeDeferIdleMaxUs = idleUs;
++    }
 +    const uint32_t f0 = gDispMmio[NV_DISP_FRAME_COUNTER / 4];
 +    gDispMmio[NV_PLANE_SURF_A / 4] = (uint32_t)gXeFlipGgtt[slot];	/* the arming write */
 +    const uint64_t t0 = mach_absolute_time();
@@ -148,21 +228,204 @@
 +    gXeFlipPrev = gXeFlipFront;
 +    gXeFlipFront = s; ((OSObject *)s)->retain();
 +    gXeFlipLive = slot; gXeFlipNext = slot + 1;
++    const SInt64 armUs = nvIopUsBetween(t0, mach_absolute_time());
++    gXeDeferArmLastUs = armUs; if (armUs > gXeDeferArmMaxUs) gXeDeferArmMaxUs = armUs;
 +    if (latched) OSAddAtomic64(1, &gCntXeFlip); else OSAddAtomic64(1, &gCntXeFlipFail);
 +    return (latched);
- }
++}
++// K8 (synchronous): the old zero-copy flip, no idle wait - kept for A/B against the deferred path (defer=0).
++static bool nvAccelXeFlip(IOService *fb, unsigned head, IOSurface *s, unsigned w, unsigned h, unsigned pitch)
++{
++    if (!gIopXeFlip || !gDispMmio || !s || head != 4) return (false);
++    return (nvAccelXeFlipArm(s, w, h, pitch, false));
++}
++// True while a deferred frame is queued or in flight: WindowServer must not recycle the frame's surface yet.
++// If the worker stops making progress the display link must not hang on it (that is what got WindowServer killed by
++// the watchdog on 2026-10-26): after 250 ms the busy state is dropped, defer is switched off and the transaction is
++// reported complete, so the desktop stays alive and the next frames go through the synchronous path.
++static bool nvAccelXeFlipBusy(void)
++{
++    if (!gIopXeDefer || !gIopXeReportBusy) return (false);
++    if (__atomic_load_n(&gXeFlipBusy, __ATOMIC_ACQUIRE) == 0) return (false);
++    const SInt64 since = __atomic_load_n(&gXeFlipBusySince, __ATOMIC_ACQUIRE);
++    if (since) {
++        const SInt64 age = nvIopUsBetween((uint64_t)since, mach_absolute_time());
++        if (age > 250000) {
++            OSAddAtomic64(1, &gCntXeDeferForced);
++            gIopXeDefer = 0;
++            __atomic_store_n(&gXeFlipBusy, 0, __ATOMIC_RELEASE);
++            ALOG("iop: deferred flip stuck for %lld us (queued %u armed %lld signals %lld) -- debug.xegfxaccel_iop_xe_defer=0",
++                (long long)age, (unsigned)(gXeFlipQTail - gXeFlipQHead),
++                (long long)gCntXeDeferArmed, (long long)gCntXeDeferSignals);
++            return (false);
++        }
++    }
++    return (true);
++}
++// Deferred flip worker: pops one queued frame at a time, maps its pages and waits for GT idle in this thread (not
++// WindowServer's), arms the plane, clears the busy flag and only then signals the display-pipe transaction interrupt.
++// The order matters: WindowServer wakes on the interrupt and calls isTransactionComplete again, and it must already
++// see the transaction as complete at that point.  One signal per frame WindowServer handed over.
++static void nvAccelXeFlipDeferRun(void *, void *)
++{
++    for (;;) {
++        if (!gXeFlipLock) return;
++        NVXeFlipPend p; p.pipe = nullptr; p.s = nullptr; p.w = p.h = p.pitch = 0;
++        IOLockLock(gXeFlipLock);
++        if (gXeFlipQHead == gXeFlipQTail) {	// nothing queued: idle out and let the display thread start us again
++            __atomic_store_n(&gXeFlipBusy, 0, __ATOMIC_RELEASE);
++            gXeFlipBusySince = 0;
++            IOLockWakeup(gXeFlipLock, (event_t)&gXeFlipBusy, false);
++            IOLockUnlock(gXeFlipLock);
++            return;
++        }
++        p = gXeFlipQ[gXeFlipQHead % NV_XE_FLIP_QUEUE];
++        gXeFlipQ[gXeFlipQHead % NV_XE_FLIP_QUEUE].s = nullptr;
++        gXeFlipQHead++;
++        const SInt64 gen = gXeFlipGen;
++        IOLockUnlock(gXeFlipLock);
++
++        if (gen != __atomic_load_n(&gXeFlipGen, __ATOMIC_ACQUIRE)) {	// the pipe went away while this frame was queued
++            OSAddAtomic64(1, &gCntXeDeferDropped);
++            ((OSObject *)p.s)->release();
++            continue;
++        }
++        const bool ok = nvAccelXeFlipArm(p.s, p.w, p.h, p.pitch, true);
++        if (ok) {
++            OSAddAtomic64(1, &gCntXeDeferArmed);
++            gXeFlipArmRun = 0;
++        } else {
++            OSAddAtomic64(1, &gCntXeDeferDropped);
++            ((OSObject *)p.s)->release();	// the worker owns the reference until the frame is on the panel
++            if (++gXeFlipArmRun >= 6 && gIopXeDefer) {
++                gIopXeDefer = 0;
++                ALOG("iop: 6 deferred frames in a row did not reach the panel -- debug.xegfxaccel_iop_xe_defer=0 (synchronous flip)");
++            }
++        }
++        if (gen != __atomic_load_n(&gXeFlipGen, __ATOMIC_ACQUIRE)) continue;	// pipe is gone: never signal a dead object
++        bool last = false;
++        IOLockLock(gXeFlipLock);
++        last = (gXeFlipQHead == gXeFlipQTail);
++        if (last) {		// clear busy *before* the signal, so the waiter that wakes on it sees the completion
++            __atomic_store_n(&gXeFlipBusy, 0, __ATOMIC_RELEASE);
++            gXeFlipBusySince = 0;
++        }
++        IOLockUnlock(gXeFlipLock);
++        OSAddAtomic64(1, &gCntXeDeferSignals);
++        _ZN18IOAccelDisplayPipe26signalTransactionInterruptEPv(p.pipe, nullptr);
++    }
++}
++// Display thread: hand the frame to the worker.  One queue entry per display transaction, so the worker signals each
++// one; the caller keeps its own reference, this takes one more.  An overflow completes that transaction right away
++// (with a device-side partial frame as the price) instead of leaving WindowServer waiting for a wakeup forever.
++static void nvAccelXeFlipDeferQueue(void *pipe, IOSurface *s, unsigned w, unsigned h, unsigned pitch)
++{
++    if (!gXeFlipLock) {
++        IOLock *l = IOLockAlloc();
++        if (l && !OSCompareAndSwapPtr(nullptr, l, (void *volatile *)&gXeFlipLock)) IOLockFree(l);
++    }
++    if (!gXeFlipCall) gXeFlipCall = thread_call_allocate(nvAccelXeFlipDeferRun, nullptr);
++    if (!gXeFlipLock || !gXeFlipCall) { OSAddAtomic64(1, &gCntXeDeferDropped); return; }
++    ((OSObject *)s)->retain();
++    bool start = false, overflow = false;
++    IOLockLock(gXeFlipLock);
++    if (gXeFlipQTail - gXeFlipQHead >= NV_XE_FLIP_QUEUE) {
++        overflow = true;
++    } else {
++        NVXeFlipPend *q = &gXeFlipQ[gXeFlipQTail % NV_XE_FLIP_QUEUE];
++        q->pipe = pipe; q->s = s; q->w = w; q->h = h; q->pitch = pitch;
++        gXeFlipQTail++;
++        OSAddAtomic64(1, &gCntXeDeferQueued);
++        const SInt64 depth = (SInt64)(gXeFlipQTail - gXeFlipQHead);
++        if (depth > gXeDeferQMaxDepth) gXeDeferQMaxDepth = depth;
++        if (__atomic_load_n(&gXeFlipBusy, __ATOMIC_ACQUIRE) == 0) {
++            __atomic_store_n(&gXeFlipBusy, 1, __ATOMIC_RELEASE);
++            gXeFlipBusySince = (SInt64)mach_absolute_time();
++            start = true;
++        }
++    }
++    IOLockUnlock(gXeFlipLock);
++    if (overflow) {
++        OSAddAtomic64(1, &gCntXeDeferDropped);
++        ((OSObject *)s)->release();
++        OSAddAtomic64(1, &gCntXeDeferSignals);
++        _ZN18IOAccelDisplayPipe26signalTransactionInterruptEPv(pipe, nullptr);
++        return;
++    }
++    if (start) thread_call_enter(gXeFlipCall);
++}
  #define NVIOP_LOG_MAX 40
  static unsigned gIopLogs = 0;
-@@ -1173,6 +1280,8 @@
+ #define NVIOPLOG(fmt, ...) do { if (gIopLogs < NVIOP_LOG_MAX) { gIopLogs++; ALOG("iop: " fmt, ##__VA_ARGS__); } } while (0)
+@@ -1173,6 +1477,28 @@
  void NVDisplayPipe::free()
  {
      iopDropSources();
++    // K9: the deferred flip worker must be done with the pipe before it goes away; its queued frame would otherwise
++    // be armed for a display pipe that is being freed.
++    if (gXeFlipLock) {
++        IOLockLock(gXeFlipLock);
++        __atomic_add_fetch(&gXeFlipGen, 1, __ATOMIC_ACQ_REL);
++        while (gXeFlipQHead != gXeFlipQTail) {
++            NVXeFlipPend *q = &gXeFlipQ[gXeFlipQHead % NV_XE_FLIP_QUEUE];
++            if (q->s) { ((OSObject *)q->s)->release(); q->s = nullptr; q->pipe = nullptr; }
++            gXeFlipQHead++;
++        }
++        gXeFlipQHead = gXeFlipQTail = 0;
++        IOLockUnlock(gXeFlipLock);
++        uint64_t end = 0; clock_interval_to_deadline(100, kMillisecondScale, &end);
++        while (__atomic_load_n(&gXeFlipBusy, __ATOMIC_ACQUIRE) != 0 && mach_absolute_time() < end) IOSleep(1);
++        if (__atomic_load_n(&gXeFlipBusy, __ATOMIC_ACQUIRE) != 0)
++            ALOG("iop: deferred flip worker still busy when the display pipe went away -- dropping the busy state");
++        IOLockLock(gXeFlipLock);
++        __atomic_store_n(&gXeFlipBusy, 0, __ATOMIC_RELEASE);
++        IOLockUnlock(gXeFlipLock);
++    }
 +    nvAccelXeFlipDrop(&gXeFlipPrev);
 +    nvAccelXeFlipDrop(&gXeFlipFront);
      IOAccelLegacyDisplayPipe::free();
  }
  
-@@ -1274,7 +1383,9 @@
+@@ -1207,10 +1533,11 @@
+ }
+ 
+ static bool nvAccelIopAsyncBusy(const void *pipe);
++static bool nvAccelXeFlipBusy(void);
+ bool NVDisplayPipe::isTransactionComplete(IOAccelDisplayPipeTransaction2 *)
+ {
+     NVPIPE_CNT(gCntPipeComplete);
+-    return gNvIop != 0 && !nvAccelIopAsyncBusy(this);
++    return gNvIop != 0 && !nvAccelIopAsyncBusy(this) && !nvAccelXeFlipBusy();
+ }
+ 
+ static void nvAccelSurfScanoutSync(IOSurface *s);
+@@ -1233,6 +1560,25 @@
+     IOSurface *s  = txn->getPlaneIOSurface(0, 0);
+     OSObject  *ro = txn->getPlaneResource(0, 0);
+     if (!s && !ro) { OSAddAtomic64(1, &gCntIopEmpty); return kIOReturnSuccess; }
++
++    // K9: with the no-wait compositor this frame may still be under the GPU.  Hand it to the flip worker instead of
++    // waiting here: WindowServer's display thread stays free, and the worker writes PLANE_SURF only after the GPU
++    // reports idle.  The frame's geometry has to be the scanout's, as in the synchronous flip below.
++    if (gIopXeDefer && gIopXeFlip && s && head == 4) {
++        const unsigned W = (unsigned)s->getWidth(), H = (unsigned)s->getHeight(), P = (unsigned)s->getBytesPerRow();
++        if (W && H && W <= 16384 && H <= 16384 && P >= 4 * W && !(P & 3) && (unsigned long long)P * H <= 64ull * 1024 * 1024) {
++            struct NVRMVramRequest q;
++            for (unsigned i = 0; i < sizeof q; i++) ((volatile unsigned char *)&q)[i] = 0;
++            q.version = NVRM_VRAM_ABI_VERSION;
++            const IOReturn qr = a->askFramebufferForScanout(&q, fb);
++            if (qr == kIOReturnSuccess && q.kva && q.pitch >= 4 && q.height && W == q.width && H == q.height) {
++                nvAccelXeFlipDeferQueue(this, s, W, H, P);
++                nvIopStat(&gIopTxnLastUs, &gIopTxnMaxUs, &gIopTxnSumUs, nvIopUsBetween(txnStart, mach_absolute_time()));
++                gIopLastTxnEnd = mach_absolute_time();
++                return kIOReturnSuccess;
++            }
++        }
++    }
+ 
+     const volatile unsigned int *src = nullptr; unsigned w = 0, h = 0, pitch = 0; bool fromRes = false;
+     NVResource *res = OSDynamicCast(NVResource, ro);
+@@ -1274,7 +1620,9 @@
          if (P < 4 * W || (P & 3)) NVIOP_FAIL(kIOReturnBadArgument, "surface %llux%llu: row pitch %llu is under 4*W or not word-aligned", W, H, P);
          IOMemoryDescriptor *md = s->getMemoryDescriptor();
          if (!md) NVIOP_FAIL(kIOReturnNoMemory, "surface 0x%x has no memory descriptor", s->getSurfaceID());
@@ -172,11 +435,11 @@
          if (!src) NVIOP_FAIL(kIOReturnVMError, "surface 0x%x would not prepare/map %llu bytes", s->getSurfaceID(), H * P);
          w = (unsigned)W; h = (unsigned)H; pitch = (unsigned)P;
      } else {
-@@ -1289,10 +1400,30 @@
+@@ -1289,10 +1637,30 @@
      if (ret != kIOReturnSuccess || !q.kva || q.pitch < 4 || !q.height) NVIOP_FAIL(kIOReturnNotReady, "framebuffer would not describe its scanout (0x%x kva %p pitch %u)", (unsigned)ret, q.kva, q.pitch);
      if (w != q.width || h != q.height) NVIOP_FAIL(kIOReturnBadArgument, "source %ux%u is not the scanout's %ux%u", w, h, q.width, q.height);
  
-+    if (gIopXeFlip && s && nvAccelXeFlip(fb, head, s, w, h, pitch)) {
++    if (!gIopXeDefer && gIopXeFlip && s && nvAccelXeFlip(fb, head, s, w, h, pitch)) {
 +        nvAccelIopHome(fb, head);
 +        nvIopStat(&gIopTxnLastUs, &gIopTxnMaxUs, &gIopTxnSumUs, nvIopUsBetween(txnStart, mach_absolute_time()));
 +        gIopLastTxnEnd = mach_absolute_time();
@@ -203,7 +466,7 @@
      const uint64_t copyStart = mach_absolute_time();
      if (gIopMemcpy) {
          if (q.pitch == pitch) {
-@@ -1311,6 +1442,23 @@
+@@ -1311,6 +1679,23 @@
          }
      }
      nvIopStat(&gIopCopyLastUs, &gIopCopyMaxUs, &gIopCopySumUs, nvIopUsBetween(copyStart, mach_absolute_time()));
@@ -227,7 +490,7 @@
      OSAddAtomic64(1, fromRes ? &gCntIopSrcRes : &gCntIopSrcSurf);
      const SInt64 n = OSAddAtomic64(1, &gCntIopOk);
      const SInt64 nh = OSAddAtomic64(1, &gCntIopOkHead[head]);
-@@ -1405,6 +1553,16 @@
+@@ -1405,6 +1790,16 @@
  NVACCEL_CNT(nvaccel_iop_blank,        gCntIopBlank,       "K6: frames copied whose 64 samples were all ONE colour (a blank frame)");
  static SInt64 gCntIopCopySkip;
  NVACCEL_CNT(nvaccel_iop_copy_skip,    gCntIopCopySkip,    "frames kept on the panel because the surface's newest pixels were not yet in system memory");
@@ -244,7 +507,7 @@
  static int    gIopFlip = 0;
  static SInt64 gCntIopFlip, gCntIopFlipHome, gCntIopFlipNo[8];
  SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_flip, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, &gIopFlip, 0, "1 = scan the composited IOSurface out of its own VRAM (no copy)");
-@@ -1593,6 +1751,18 @@
+@@ -1593,6 +1988,36 @@
        sysctl_register_oid(&sysctl__debug_nvaccel_iop_vblank);          sysctl_register_oid(&sysctl__debug_nvaccel_iop_vblank_waits);
        sysctl_register_oid(&sysctl__debug_nvaccel_iop_vblank_skips);    sysctl_register_oid(&sysctl__debug_nvaccel_iop_vblank_last_us);
        sysctl_register_oid(&sysctl__debug_nvaccel_iop_vblank_max_us); }
@@ -252,6 +515,24 @@
 +          sysctl__debug_nvaccel_iop_xe_flip_fail;
 +      sysctl_register_oid(&sysctl__debug_nvaccel_iop_xe_flip);      sysctl_register_oid(&sysctl__debug_nvaccel_iop_xe_flip_miss);
 +      sysctl_register_oid(&sysctl__debug_nvaccel_iop_xe_flip_fail); }
++    { extern struct sysctl_oid sysctl__debug_nvaccel_iop_xe_defer, sysctl__debug_nvaccel_iop_xe_wait_idle,
++          sysctl__debug_nvaccel_iop_xe_idle_ms, sysctl__debug_nvaccel_iop_xe_report_busy;
++      sysctl_register_oid(&sysctl__debug_nvaccel_iop_xe_defer);       sysctl_register_oid(&sysctl__debug_nvaccel_iop_xe_wait_idle);
++      sysctl_register_oid(&sysctl__debug_nvaccel_iop_xe_idle_ms);     sysctl_register_oid(&sysctl__debug_nvaccel_iop_xe_report_busy); }
++    { extern struct sysctl_oid sysctl__debug_nvaccel_iop_xe_defer_queued, sysctl__debug_nvaccel_iop_xe_defer_armed,
++          sysctl__debug_nvaccel_iop_xe_defer_coalesced, sysctl__debug_nvaccel_iop_xe_defer_dropped,
++          sysctl__debug_nvaccel_iop_xe_defer_signals, sysctl__debug_nvaccel_iop_xe_defer_forced,
++          sysctl__debug_nvaccel_iop_xe_defer_max_depth,
++          sysctl__debug_nvaccel_iop_xe_idle_waits, sysctl__debug_nvaccel_iop_xe_idle_forced,
++          sysctl__debug_nvaccel_iop_xe_idle_last_us, sysctl__debug_nvaccel_iop_xe_idle_max_us,
++          sysctl__debug_nvaccel_iop_xe_arm_last_us, sysctl__debug_nvaccel_iop_xe_arm_max_us;
++      sysctl_register_oid(&sysctl__debug_nvaccel_iop_xe_defer_queued);    sysctl_register_oid(&sysctl__debug_nvaccel_iop_xe_defer_armed);
++      sysctl_register_oid(&sysctl__debug_nvaccel_iop_xe_defer_coalesced); sysctl_register_oid(&sysctl__debug_nvaccel_iop_xe_defer_dropped);
++      sysctl_register_oid(&sysctl__debug_nvaccel_iop_xe_defer_signals);   sysctl_register_oid(&sysctl__debug_nvaccel_iop_xe_defer_forced);
++      sysctl_register_oid(&sysctl__debug_nvaccel_iop_xe_defer_max_depth);
++      sysctl_register_oid(&sysctl__debug_nvaccel_iop_xe_idle_waits);      sysctl_register_oid(&sysctl__debug_nvaccel_iop_xe_idle_forced);
++      sysctl_register_oid(&sysctl__debug_nvaccel_iop_xe_idle_last_us);    sysctl_register_oid(&sysctl__debug_nvaccel_iop_xe_idle_max_us);
++      sysctl_register_oid(&sysctl__debug_nvaccel_iop_xe_arm_last_us);     sysctl_register_oid(&sysctl__debug_nvaccel_iop_xe_arm_max_us); }
 +    { extern struct sysctl_oid sysctl__debug_nvaccel_iop_surf_repeat, sysctl__debug_nvaccel_iop_same_refresh,
 +          sysctl__debug_nvaccel_iop_copy_overrun, sysctl__debug_nvaccel_iop_copy_cross,
 +          sysctl__debug_nvaccel_iop_src_changed, sysctl__debug_nvaccel_iop_map_last_us,
@@ -263,20 +544,77 @@
      nvXeTraceStart();
  #endif
      sysctl_register_oid(&sysctl__debug_nvaccel_heads_published); sysctl_register_oid(&sysctl__debug_nvaccel_heads_registered);
-@@ -2572,6 +2742,8 @@
+@@ -2572,6 +2997,30 @@
             "1 = copy the frame with memcpy (default), 0 = the word-by-word loop");
  SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_vblank, CTLFLAG_RW | CTLFLAG_LOCKED, &gIopVblank, 0,
             "1 = copy each frame right after the panel's vblank (default), 0 = copy as soon as the transaction arrives");
 +SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_xe_flip, CTLFLAG_RW | CTLFLAG_LOCKED, &gIopXeFlip, 0,
 +    "1 = flip the compositor's own pages through reserved GGTT slots (zero copy), 0 = CPU copy (default)");
++// K9: deferred zero-copy flip (plan 2): the display thread only queues the frame, a worker waits for GT idle
++SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_xe_defer, CTLFLAG_RW | CTLFLAG_LOCKED, &gIopXeDefer, 0,
++    "1 = defer the Intel zero-copy plane write to a worker that waits for the GPU to be idle, 0 = synchronous flip (default)");
++SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_xe_wait_idle, CTLFLAG_RW | CTLFLAG_LOCKED, &gIopXeWaitIdle, 0,
++    "1 = the deferred flip waits for the GPU to be idle before the plane write (default), 0 = arm without ordering");
++SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_xe_idle_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &gIopXeIdleMs, 0,
++    "longest wait for the GPU to be idle in the deferred flip, ms (on a timeout the frame is armed anyway)");
++SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_xe_report_busy, CTLFLAG_RW | CTLFLAG_LOCKED, &gIopXeReportBusy, 0,
++    "1 = isTransactionComplete is false while a deferred flip is queued/in flight (default), 0 = always complete");
++SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_iop_xe_defer_queued, CTLFLAG_RD | CTLFLAG_LOCKED, &gCntXeDeferQueued, "frames handed to the deferred flip worker");
++SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_iop_xe_defer_armed, CTLFLAG_RD | CTLFLAG_LOCKED, &gCntXeDeferArmed, "deferred frames that reached the panel");
++SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_iop_xe_defer_coalesced, CTLFLAG_RD | CTLFLAG_LOCKED, &gCntXeDeferCoalesced, "queued deferred frames replaced by a newer one");
++SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_iop_xe_defer_dropped, CTLFLAG_RD | CTLFLAG_LOCKED, &gCntXeDeferDropped, "deferred frames that never reached the panel");
++SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_iop_xe_defer_signals, CTLFLAG_RD | CTLFLAG_LOCKED, &gCntXeDeferSignals, "display-pipe transaction interrupts signalled by the deferred flip worker");
++SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_iop_xe_defer_forced, CTLFLAG_RD | CTLFLAG_LOCKED, &gCntXeDeferForced, "deferred flips whose busy state was dropped by the stuck-worker escape hatch");
++SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_iop_xe_defer_max_depth, CTLFLAG_RD | CTLFLAG_LOCKED, &gXeDeferQMaxDepth, "longest deferred flip queue, frames");
++SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_iop_xe_idle_waits, CTLFLAG_RD | CTLFLAG_LOCKED, &gCntXeDeferIdleWait, "deferred flips that waited for GT idle successfully");
++SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_iop_xe_idle_forced, CTLFLAG_RD | CTLFLAG_LOCKED, &gCntXeDeferIdleForced, "deferred flips armed without a GT-idle confirmation (timeout)");
++SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_iop_xe_idle_last_us, CTLFLAG_RD | CTLFLAG_LOCKED, &gXeDeferIdleLastUs, "last GT-idle wait, us");
++SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_iop_xe_idle_max_us, CTLFLAG_RD | CTLFLAG_LOCKED, &gXeDeferIdleMaxUs, "longest GT-idle wait, us");
++SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_iop_xe_arm_last_us, CTLFLAG_RD | CTLFLAG_LOCKED, &gXeDeferArmLastUs, "last deferred arm+latch, us");
++SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_iop_xe_arm_max_us, CTLFLAG_RD | CTLFLAG_LOCKED, &gXeDeferArmMaxUs, "longest deferred arm+latch, us");
  SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_iop_vblank_waits, CTLFLAG_RD | CTLFLAG_LOCKED, &gCntIopVblankWaits, "frames copied after a vblank wait");
  SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_iop_vblank_skips, CTLFLAG_RD | CTLFLAG_LOCKED, &gCntIopVblankSkips, "frames copied without a vblank wait (no MMIO, gate off, or timeout)");
  SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_iop_vblank_last_us, CTLFLAG_RD | CTLFLAG_LOCKED, &gIopVblankLastUs, "wait for the last vblank, us");
 --- a/kexts/NVRM/accel/xegfx_accel_names.h
 +++ b/kexts/NVRM/accel/xegfx_accel_names.h
-@@ -167,4 +167,26 @@
+@@ -166,5 +166,61 @@
+ #define sysctl__debug_nvaccel_iop_vblank_max_us sysctl__debug_xegfxaccel_iop_vblank_max_us
  #define nvaccel_iop_memcpy xegfxaccel_iop_memcpy
  #define sysctl__debug_nvaccel_iop_memcpy sysctl__debug_xegfxaccel_iop_memcpy
++#define nvaccel_iop_xe_defer xegfxaccel_iop_xe_defer
++#define sysctl__debug_nvaccel_iop_xe_defer sysctl__debug_xegfxaccel_iop_xe_defer
++#define nvaccel_iop_xe_wait_idle xegfxaccel_iop_xe_wait_idle
++#define sysctl__debug_nvaccel_iop_xe_wait_idle sysctl__debug_xegfxaccel_iop_xe_wait_idle
++#define nvaccel_iop_xe_idle_ms xegfxaccel_iop_xe_idle_ms
++#define sysctl__debug_nvaccel_iop_xe_idle_ms sysctl__debug_xegfxaccel_iop_xe_idle_ms
++#define nvaccel_iop_xe_report_busy xegfxaccel_iop_xe_report_busy
++#define sysctl__debug_nvaccel_iop_xe_report_busy sysctl__debug_xegfxaccel_iop_xe_report_busy
++#define nvaccel_iop_xe_defer_queued xegfxaccel_iop_xe_defer_queued
++#define sysctl__debug_nvaccel_iop_xe_defer_queued sysctl__debug_xegfxaccel_iop_xe_defer_queued
++#define nvaccel_iop_xe_defer_armed xegfxaccel_iop_xe_defer_armed
++#define sysctl__debug_nvaccel_iop_xe_defer_armed sysctl__debug_xegfxaccel_iop_xe_defer_armed
++#define nvaccel_iop_xe_defer_coalesced xegfxaccel_iop_xe_defer_coalesced
++#define sysctl__debug_nvaccel_iop_xe_defer_coalesced sysctl__debug_xegfxaccel_iop_xe_defer_coalesced
++#define nvaccel_iop_xe_defer_dropped xegfxaccel_iop_xe_defer_dropped
++#define sysctl__debug_nvaccel_iop_xe_defer_dropped sysctl__debug_xegfxaccel_iop_xe_defer_dropped
++#define nvaccel_iop_xe_idle_waits xegfxaccel_iop_xe_idle_waits
++#define sysctl__debug_nvaccel_iop_xe_idle_waits sysctl__debug_xegfxaccel_iop_xe_idle_waits
++#define nvaccel_iop_xe_idle_forced xegfxaccel_iop_xe_idle_forced
++#define sysctl__debug_nvaccel_iop_xe_idle_forced sysctl__debug_xegfxaccel_iop_xe_idle_forced
++#define nvaccel_iop_xe_idle_last_us xegfxaccel_iop_xe_idle_last_us
++#define sysctl__debug_nvaccel_iop_xe_idle_last_us sysctl__debug_xegfxaccel_iop_xe_idle_last_us
++#define nvaccel_iop_xe_idle_max_us xegfxaccel_iop_xe_idle_max_us
++#define sysctl__debug_nvaccel_iop_xe_idle_max_us sysctl__debug_xegfxaccel_iop_xe_idle_max_us
++#define nvaccel_iop_xe_arm_last_us xegfxaccel_iop_xe_arm_last_us
++#define sysctl__debug_nvaccel_iop_xe_arm_last_us sysctl__debug_xegfxaccel_iop_xe_arm_last_us
++#define nvaccel_iop_xe_arm_max_us xegfxaccel_iop_xe_arm_max_us
++#define sysctl__debug_nvaccel_iop_xe_arm_max_us sysctl__debug_xegfxaccel_iop_xe_arm_max_us
++#define nvaccel_iop_xe_defer_signals xegfxaccel_iop_xe_defer_signals
++#define sysctl__debug_nvaccel_iop_xe_defer_signals sysctl__debug_xegfxaccel_iop_xe_defer_signals
++#define nvaccel_iop_xe_defer_forced xegfxaccel_iop_xe_defer_forced
++#define sysctl__debug_nvaccel_iop_xe_defer_forced sysctl__debug_xegfxaccel_iop_xe_defer_forced
++#define nvaccel_iop_xe_defer_max_depth xegfxaccel_iop_xe_defer_max_depth
++#define sysctl__debug_nvaccel_iop_xe_defer_max_depth sysctl__debug_xegfxaccel_iop_xe_defer_max_depth
  #endif
 +#define nvaccel_iop_surf_repeat xegfxaccel_iop_surf_repeat
 +#define sysctl__debug_nvaccel_iop_surf_repeat sysctl__debug_xegfxaccel_iop_surf_repeat
