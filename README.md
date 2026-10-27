@@ -1,6 +1,6 @@
 # ArrowBridge
 
-**ArrowBridge** 是面向 Intel Arrow Lake-HX Xe-LPG 核显的 macOS 图形与内屏接管实验项目。当前实机为 Intel Core Ultra 9 275HX，核显设备号为 `8086:7D67`，系统为 macOS Tahoe 26.7.1。项目已经打通 XeGfx 内核驱动、ANV Vulkan、XeMTL Metal、WindowServer 桌面合成与内屏显示链路，并把显示提交推进到 GGTT 槽零拷贝 flip。后续工作继续围绕系统刷新节拍、HiDPI、硬件光标与电源管理展开。
+**ArrowBridge** 是面向 Intel Arrow Lake-HX Xe-LPG 核显的 macOS 图形与内屏接管实验项目。当前实机为 Intel Core Ultra 9 275HX，核显设备号为 `8086:7D67`，系统为 macOS Tahoe 26.7.1。项目已经打通 XeGfx 内核驱动、ANV Vulkan、XeMTL Metal、WindowServer 桌面合成与内屏显示链路，并把显示提交推进到 GGTT 槽零拷贝 flip；K9 延迟 flip 又把 GPU 完成与扫描面切换从 WindowServer 同步等待中解耦，在 2560x1600@60Hz 的当前面板上恢复到约 60fps 的加速桌面。当前工作重点已经从“能否显示”转向两条主线：一条继续压缩 XeMTL→ANV 的 CPU 编码成本，另一条验证绕开 Vulkan API 的 Intel-native Metal backend。
 
 项目以单机实测为边界。仓库保存经过验证的补丁、安装脚本、试验脚本与技术记录，上游源码从对应项目获取。同机 OpenCore 配置见 [YaoShi16-Ultra-OpenCore-efi](https://github.com/Mountainatic/YaoShi16-Ultra-OpenCore-efi)。
 
@@ -50,9 +50,13 @@
 
 9. **display-pipe 直接 flip 到 surface backing**
 
-   XeGfxAccel 完成新帧的 GGTT 映射后，把槽的 GGTT 偏移写入 `PLANE_SURF_1_A`。显示引擎在下一次 vblank 锁存新的 surface，并直接扫描 WindowServer 合成帧。
+   XeGfxAccel 完成新帧的 GGTT 映射后，不再由 CPU 搬运整帧。三个槽按帧轮转，当前帧与前两帧持续保留映射，后续 flip 确认旧槽退出扫描后再回收。CPU copy 保留为故障回退路径，`debug.xegfxaccel_iop_xe_flip=0` 可以在运行时切回拷贝提交。
 
-   三个槽按帧轮转。当前帧与前两帧持续保留映射，后续 flip 确认旧槽退出扫描后再回收。CPU copy 保留为故障回退路径，`debug.xegfxaccel_iop_xe_flip=0` 可以在运行时切回拷贝提交。
+10. **K9 延迟 flip 把 GPU 完成与扫描切换移到内核侧排序**
+
+   直接 no-wait 可以让 WindowServer 更快返回，但如果 GPU 尚未完成写入就立即改 `PLANE_SURF_1_A`，会出现半路呈现、撕裂和 UI 异常。ArrowBridge 因此在 core 侧加入 `xgFlipQuery` 空闲探测，并在 XeGfxAccel 中加入 defer worker：新帧先映射到 GGTT 槽，WindowServer 提交立即返回，worker 等待 i915 engine 空闲后再 arm plane，最终仍由 vblank 锁存新 surface。
+
+   这条 K9 路径由 `debug.xegfxaccel_iop_xe_defer=1` 控制，`defer_armed`、`defer_signals` 与 `wait_max_us` 提供运行时观测；`debug.xegfxaccel_iop_xe_defer=0` 可以退回同步 flip。
 
 ## 推进过程中解决的问题
 
@@ -123,11 +127,52 @@ ArrowBridge 在 `0008-core-ggtt-flip-slots.patch` 中让 XeGfx core 预留 GGTT 
 
 随后桌面继续稳定运行 30 分钟以上，撕裂现象也随整帧 copy 退出主路径而消失。
 
-### 6. 合成节拍瓶颈进一步收敛到 CA 到 Metal 编码路径
+### 6. K9 延迟 flip：去掉 WindowServer 的逐帧 GPU 完成等待
 
-零拷贝切换之后，display-pipe 的整帧搬运已经退出主路径。A/B 试验也验证了逐帧等待合成完成这一同步点对吞吐影响有限。
+零拷贝 flip 打通以后，WindowServer 仍曾在 `commitAndWaitUntilSubmitted` 一类同步路径里每帧等待 GPU 完成，实测等待约 7.5–12.8 ms/帧；简单 no-wait 虽把窗口基准从 19.1fps 提高到 28.4fps，但会破坏 GPU 写入与扫描切换的顺序。
 
-现阶段帧率主要受 WindowServer 的 CoreAnimation 到 Metal 编码与翻译路径影响。刷新节拍与 detailed timing 继续补齐以后，可以在稳定零拷贝基线上进一步定位这一段的软件开销。
+K9 把这个顺序约束移到内核侧：core 的 `xg_i915_idle()` 通过 `xgFlipQuery` 暴露 engine 空闲状态，XeGfxAccel 的 defer worker 在帧完成后再 arm `PLANE_SURF_1_A`。在 2560x1600@60Hz 的当前面板上，延迟 flip 已把加速桌面恢复到约 60fps，同时保持窗口拖动、滚动与光标正常，无撕裂。
+
+完整机制、sysctl 与手动 bring-up 流程见 [docs/k9-deferred-flip.md](docs/k9-deferred-flip.md)。
+
+### 7. XDIFF 把剩余热点收敛到 Metal→Vulkan CPU 翻译
+
+K9 之后，GPU wait、整帧 CPU copy、IOSurface host-import fallback 与 image churn 都已退出主要热点。XeMTL 的 XDIFF 计数器在安静的 60Hz 环境下得到下面一组 CPU 画像：
+
+| phase | fps | WindowServer CPU ms/帧 | draws/帧 | descriptor writes/帧 | new sets/帧 | 已计时插件四段 ms/帧 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| light | 50.7 | 12.5 | 5.0 | 299 | 7.1 | 1.14 |
+| steady | 48.1 | 14.0 | 50.6 | 1843 | 53.8 | 2.85 |
+| churn | 50.4 | 11.3 | 25.8 | 1709 | 44.4 | 2.88 |
+| drag | 48.8 | 12.3 | 6.0 | 352 | 9.0 | 0.86 |
+| fullscreen | 50.2 | 12.9 | 48.0 | 1738 | 51.0 | 2.37 |
+
+同一套 XeMTL 前端在 NVIDIA/NVK 合成基准上的 steady draw 为 5.38 µs/draw，state churn 为 6.27 µs/draw；Intel/ANV 路径的重内容 phase 折算约 49–56 µs/draw。sampler 命中已经达到 92–99%，surface 请求只有 0.05–0.38 次/帧、image churn 只有 0.1–0.4 次/帧，说明 surface/import/cache 修复已经生效。
+
+目前最值得继续压缩的是 descriptor 生命周期与 Metal→Vulkan 状态翻译，而不是显示扫描或 GPU 算力。插件中已计时的四段只占约 0.9–2.9 ms/帧，WindowServer 仍有约 8–11 ms/帧落在 CoreAnimation、XeMTL 外层 glue 与 ANV command recording 之间。
+
+### 8. Intel-native Metal backend 实验
+
+为了判断这几十微秒的 per-draw CPU 成本究竟来自 Intel 硬件还是 Vulkan 适配层，项目已经启动一条独立的 Intel-native 实验路线。该路线保留 Mesa 的 Intel 硬件知识与编译器组件，但不把 Vulkan 作为 Metal 与 Xe-LPG 之间的中间协议：
+
+```text
+Metal/XeMTL state
+      ↓
+SPIR-V → NIR → Mesa intel/compiler → gen125 ISA
+      ↓
+ISL / genxml state encoding
+      ↓
+raw i915 EXECBUFFER2
+      ↓
+XeGfx → Xe-LPG
+```
+
+当前开发工作树已经完成两块地基，但尚未合入本仓库 main：
+
+- **M2 submit/memory harness**：直接使用 raw ioctl（不链接 libdrm）完成 GEM_CREATE、WC mmap、自管 48-bit softpin GPU VA、render/copy ring 提交、GEM_WAIT 与 GPU 写回验证。steady EXECBUFFER2 的 p50 约 14 µs，200 次连续小提交全部成功；单 batch 内 10,000 条 NOOP 的 submit + wait 约 92 µs，说明 M4 必须在一个 batch 内重复大量 draw 才能测到真实 per-draw CPU encode 成本。
+- **M3 minimal 3D state encoder**：已针对 `8086:7D67` / `verx10=125` 使用 `gen125_pack.h` 生成最小 3D command stream。host-side 自检已通过；solid color 为 40 条命令 / 193 dwords，textured 为 41 条 / 195 dwords。当前仍未向 GPU 提交 3D 命令，下一步等待 shader compiler 侧的 ISA + prog_data 后，先做纯色 quad readback，再做纹理 quad 与 M4 5 万 draw A/B。
+
+这条实验的判断标准很直接：如果 native backend 的 CPU encode 能接近裸 NVK/ANV 的约 5–6 µs/draw，而显著低于当前 XeMTL→ANV 的 23–56 µs/draw，就说明主要性能税来自 Metal→Vulkan 的对象与状态翻译；届时 ANV 可以继续保留为完整功能 fallback，而常见 CoreAnimation 路径逐步转到 Intel-native backend。
 
 ## 硬件与系统
 
@@ -152,9 +197,9 @@ ArrowBridge 在 `0008-core-ggtt-flip-slots.patch` 中让 XeGfx core 预留 GGTT 
 | `0004-agdc-k5-panel-timing.patch` | XeGfx 0.0.44 | 回答 AGDC K5 link-config |
 | `0005-plugin-xemtl-port.patch` | XeGfx 0.0.35 plugin | 把插件改编为 XeMTL |
 | `0006-plugin-host-import.patch` | XeMTL | 修正只读 host import |
-| `0007-plugin-first-loss-journal.patch` | XeMTL | 记录首个 submit 与 backend failure |
-| `0008-core-ggtt-flip-slots.patch` | XeGfx 0.0.44 | 预留 GGTT 零拷贝槽并开放 flip bridge |
-| `0009-accel-zero-copy-flip.patch` | 0002 之后 | 用 GGTT 槽完成零拷贝 display flip |
+| `0007-plugin-first-loss-journal.patch` | XeMTL | 首损日志、no-wait 提交分支与逐调用 census instrumentation |
+| `0008-core-ggtt-flip-slots.patch` | XeGfx 0.0.44 | GGTT 零拷贝槽、flip bridge 与 `xgFlipQuery` engine-idle 探测 |
+| `0009-accel-zero-copy-flip.patch` | 0002 之后 | GGTT 零拷贝 display flip 与 K9 defer worker |
 | `0010-intelfb-detailed-timings.patch` | 0003 之后 | 发布 IOFBDetailedTimings 与 1280x800 HiDPI 模式 |
 
 补丁的应用顺序与基点提交见 [patches/README.md](patches/README.md)。
@@ -168,8 +213,8 @@ ArrowBridge 在 `0008-core-ggtt-flip-slots.patch` 中让 XeGfx core 预留 GGTT 
 5. 使用 `build/nvgfx/build_xegfx.sh` 构建 XeGfx core。
 6. 使用对应构建入口生成 XeGfxAccel、XeGfxIntelFB、NVRMAGDC 与 XeMTL。
 7. 使用 `scripts/install_core_044.py`、`install_upstream_accel.py` 与 `install_xeintelfb.py` 安装并重建 AuxKC。
-8. 系统启动后运行 `scripts/run_upstream_trial4.sh`，按阶段加载 core、打开 head 4、启动 display-pipe、重启一次 WindowServer 并采集遥测。
-9. 使用 `debug.xegfxaccel_iop_xe_flip=1` 进入 GGTT 零拷贝路径，并观察 `iop_xe_flips`、`iop_xe_flip_miss` 与 `iop_xe_flip_fail`。
+8. 早期链路可以继续用 `scripts/run_upstream_trial4.sh` 做分阶段验证；当前 K9 手动 bring-up 使用 `scripts/run_upstream_trial5.sh`，`scripts/resume-bringup.sh` 则把 core、head 4、display-pipe、K9 sysctl 与单次 WindowServer 重启串成完整恢复流程。
+9. 使用 `debug.xegfxaccel_iop_xe_flip=1` 进入 GGTT 零拷贝路径；K9 另外打开 `debug.xegfxaccel_iop_xe_defer=1`，并观察 `iop_xe_flips`、`iop_xe_flip_miss`、`iop_xe_flip_fail`、`defer_armed` 与 `defer_signals`。
 10. 使用 `scripts/soak_userptr_test.sh` 做 userptr 长压测，使用 `scripts/tools/display_probe.c` 检查刷新节拍。
 
 完整构建说明见 [docs/building.md](docs/building.md)。
@@ -183,6 +228,7 @@ ArrowBridge 在 `0008-core-ggtt-flip-slots.patch` 中让 XeGfx core 预留 GGTT 
 - [刷新率链路](docs/refresh.md)
 - [硬件光标计划](docs/cursor.md)
 - [帧路径性能](docs/performance.md)
+- [K9 延迟 flip](docs/k9-deferred-flip.md)
 - [XeMTL 插件说明](docs/plugin.md)
 
 ## 安全回退
@@ -190,6 +236,7 @@ ArrowBridge 在 `0008-core-ggtt-flip-slots.patch` 中让 XeGfx core 预留 GGTT 
 显示接管直接操作真实 GPU 与内屏通路，因此试验流程保留多级回退。
 
 - `debug.xegfxaccel_iop_xe_flip=0` 在运行时把显示提交切回 CPU copy
+- `debug.xegfxaccel_iop_xe_defer=0` 关闭 K9 延迟 flip，退回同步 flip
 - `-xeintelfbhidpi=0` 关闭新增的 1280x800 HiDPI 模式
 - `-xeintelfbdt=0` 关闭新增的 detailed timings 发布
 - `-xeintelfboff` 让 framebuffer 接管停留在固件路径
