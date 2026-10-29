@@ -8,13 +8,17 @@
 # 200 s telemetry / samples / unified log -> final collection. The machine may freeze at the
 # registration write (the display pipe goes live on the real aperture); a power cycle is the fallback.
 set -u
-# Sanitised copy: XE_PROJECT_ROOT / XE_NI_DIR point at the project tree and its helper
-# scripts (continue_headless_stage4_7.py, build/tools/display-route-snapshot).
-ROOT="${XE_PROJECT_ROOT:-$HOME/Documents/Codex/2026-10-23/d/outputs/Intel-iGPU-275HX-20261023}"
-NI="${XE_NI_DIR:-$HOME/Documents/Codex/2026-10-24/ni}"
+# Repository-local files are resolved from this script. The two inputs below are genuinely
+# external build/helper trees and therefore must be supplied explicitly.
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+: "${XE_PROJECT_ROOT:?set XE_PROJECT_ROOT to the external project/build tree containing build/tools/display-route-snapshot}"
+: "${XE_HELPER_DIR:?set XE_HELPER_DIR to the directory containing continue_headless_stage4_7.py}"
+ROOT="$XE_PROJECT_ROOT"
+NI="$XE_HELPER_DIR"
+TRIAL_ROOT="${XE_TRIAL_ROOT:-/Library/XeGfxTrial}"
 STAMP=$(date '+%Y%m%d-%H%M%S')
 TSTART=$(date '+%Y-%m-%d %H:%M:%S')
-OUT="$NI/work/upstream-trial3-$STAMP"
+OUT="$TRIAL_ROOT/upstream-trial-$STAMP"
 mkdir -p "$OUT"
 exec >>"$OUT/script.log" 2>&1
 echo "=== upstream xe 0.0.44 desktop trial 5 (vblank sync + measured refresh + zero-copy flip) $STAMP"
