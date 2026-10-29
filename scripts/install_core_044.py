@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """Install the XeGfx 0.0.44 core kext (disk layer only) and rebuild the AuxKC.
 
-The source build artifact is never guessed from a developer workspace. Set XE_CORE_SRC
+The source build artifact is never guessed from a developer workspace. Set XEGFX_CORE_KEXT
 to the kext you intend to install. Run as root on the test machine; nothing changes
 until the next reboot."""
 import datetime, json, os, pathlib, plistlib, re, shutil, subprocess, sys
 
-_src = os.environ.get("XE_CORE_SRC")
+_src = os.environ.get("XEGFX_CORE_KEXT")
 if not _src:
-    raise SystemExit("XE_CORE_SRC is required; point it at the kext build artifact to install")
+    raise SystemExit("XEGFX_CORE_KEXT is required; point it at the kext build artifact to install")
 SRC = pathlib.Path(_src).expanduser().resolve()
 DEST = pathlib.Path("/Library/Extensions/XeGfx.kext")
 KC = pathlib.Path("/Library/KernelCollections/AuxiliaryKernelExtensions.kc")
