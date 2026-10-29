@@ -1,6 +1,8 @@
 # ArrowWhatever
 
-**ArrowWhatever** 是面向 Intel Arrow Lake-HX Xe-LPG 核显的 macOS 图形项目。关注于 Intel Core Ultra 9 275HX 的 Tahoe 适配，核显设备号为 `8086:7D67`，系统为 macOS Tahoe 26.7.1。目前整合 XeGfx 内核驱动、ANV Vulkan、XeMTL Metal、WindowServer 桌面合成与内屏显示链路，推进到 GGTT 槽零拷贝 flip，K9 延迟 flip 又把 GPU 完成与扫描面切换从 WindowServer 同步等待中解耦，在 2560x1600@60Hz 的当前面板上恢复到约 60fps 的加速桌面。
+**ArrowWhatever** 是面向 Intel Arrow Lake-HX Xe-LPG 核显的 macOS 图形项目，当前主要针对 Intel Core Ultra 9 275HX 与 macOS Tahoe 26.7.1，使用的核显设备号为 `8086:7D67`。项目已经打通 [XeGfx](https://github.com/watchthelight-labs/XeGfx) 内核驱动、[Mesa ANV](https://gitlab.freedesktop.org/mesa/mesa) Vulkan、XeMTL Metal、WindowServer 桌面合成与内屏显示链路，并完成 GGTT 零拷贝 flip 与 K9 延迟 flip。
+
+目前工作的重点已经转向显示链前端：让驱动从启动阶段自动建立内屏，现在已经可以从 VBT 获取内建 eDP 信息，经 AUX 自动读取 EDID 与 DPCD，并让 macOS 正确识别内建面板；接下来继续分阶段推进 i915 对 eDP 管线的适配，先只读恢复固件状态，到 modeset ，最终进入 HBR3 + DSC 和 1920x1200@240Hz HiDPI。
 
 仓库保存经过验证的补丁、安装脚本、试验脚本与技术记录，上游源码从对应项目获取。同机 OpenCore 配置见 [YaoShi16-Ultra-OpenCore-efi](https://github.com/Mountainatic/YaoShi16-Ultra-OpenCore-efi)。
 
