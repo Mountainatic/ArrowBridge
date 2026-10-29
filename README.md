@@ -147,47 +147,31 @@ K9 把这个顺序约束移到内核侧：core 的 `xg_i915_idle()` 通过 `xgFl
 
 ## 补丁结构
 
-| 补丁 | 基线 | 作用 |
-| --- | --- | --- |
-| `0001-xg_vm-userptr-race.patch` | XeGfx 0.0.44 | 修正 userptr page lifetime |
-| `0002-accel-vblank-and-head4.patch` | XeGfx 0.0.44 | 注册 head 4 并按 vblank present |
-| `0003-intelfb-panel-timing.patch` | XeGfx 0.0.44 | 测量并发布真实面板 timing |
-| `0004-agdc-k5-panel-timing.patch` | XeGfx 0.0.44 | 回答 AGDC K5 link-config |
-| `0005-plugin-xemtl-port.patch` | XeGfx 0.0.35 plugin | 把插件改编为 XeMTL |
-| `0006-plugin-host-import.patch` | XeMTL | 修正只读 host import |
-| `0007-plugin-first-loss-journal.patch` | XeMTL | 首损日志、no-wait 提交分支与逐调用 census instrumentation |
-| `0008-core-ggtt-flip-slots.patch` | XeGfx 0.0.44 | GGTT 零拷贝槽、flip bridge 与 `xgFlipQuery` engine-idle 探测 |
-| `0009-accel-zero-copy-flip.patch` | 0002 之后 | GGTT 零拷贝 display flip 与 K9 defer worker |
-| `0010-intelfb-detailed-timings.patch` | 0003 之后 | 发布 IOFBDetailedTimings 与 1280x800 HiDPI 模式 |
-| `0011-core-native-display-m0-m4a.patch` | 0001、0008 之后 | VBT、DisplayNub、只读 KMS KAPI、scanout 与 boot arm |
-| `0012-accel-m3d-m4a-present-bootarm.patch` | 0009 之后 | adapter/accel present contract 与开机自动配置 |
-| `0013-agdc-m3d-in-kernel-arm.patch` | 0004 之后 | AGDC 内核内 arm |
-| `0014-intelfb-l0-ready.patch` | 0010 之后 | framebuffer start 完成后再发布 L0 ready |
-| `0015-adapter-xegfxdisplay-kms.patch` | 新增 | XeGfxDisplay KMS adapter |
-| `0016-tools-native-display-bringup.patch` | 新增 | M0–M4a 启动、安装、守护与验证工具 |
-| `0017-agdc-pending-retry.patch` | 0013 之后 | framebuffer 晚到时继续重试 AGDC |
-| `0018-adapter-intel-class-name.patch` | 0015 之后 | 发布 Intel framebuffer 类名 |
-| `0019-guard-tools-class-name-and-keep-armed.patch` | 0016 之后 | 更新 health/preflight 与持久 arm |
-| `0020-core-aux-edid-dpcd.patch` | 0011 之后 | AUX 自动读取 EDID/DPCD |
-| `0021-adapter-edid-ddc.patch` | 0018 之后 | 向 macOS 提供正确的 EDID/DDC |
-| `0022-core-k1-staged-edp-takeover.patch` | 0020 之后 | K1 i915 eDP 只读接管 |
+项目使用两套上游源码基点。XeGfx core 与显示相关 kext 基于 [NvGfx `xe` 提交 `5a19a73f`](https://github.com/watchthelight-labs/NvGfx/commit/5a19a73f36249efb99c44c3f9cb34603ef0c0eb8)，对应 XeGfx 0.0.44；XeMTL 基于 [NvGfx `xe` 提交 `497d521e`](https://github.com/watchthelight-labs/NvGfx/commit/497d521e925bd760c8cde5bbc17d9bf96d2ee2b4) 的 `plugin/`，对应 XeGfx 0.0.35。
 
-补丁的应用顺序与基点提交见 [patches/README.md](patches/README.md)。
+| 组件 | 源码起点 | 补丁链 | 当前作用 |
+| --- | --- | --- | --- |
+| XeGfx core / xkpi | XeGfx 0.0.44 · `5a19a73f` | `0001 → 0008 → 0011 → 0020 → 0022` | userptr、GGTT、boot-arm、VBT/KMS、AUX EDID/DPCD、K1 eDP readout |
+| XeGfxAccel | XeGfx 0.0.44 · `5a19a73f` | `0002 → 0009 → 0012` | display-pipe、零拷贝 present、adapter/accel contract、启动配置 |
+| XeGfxIntelFB | XeGfx 0.0.44 · `5a19a73f` | `0003 → 0010 → 0014` | panel timing、detailed timing、L0 ready |
+| XeGfxAGDC | XeGfx 0.0.44 · `5a19a73f` | `0004 → 0013 → 0017` | AGDC/K5、内核 arm、framebuffer pending retry |
+| XeGfxDisplay | ArrowWhatever `0015` | `0015 → 0018 → 0021` | KMS framebuffer adapter、Intel framebuffer identity、EDID/DDC |
+| native-display tools | ArrowWhatever `0016` | `0016 → 0019` | build/install、preflight、bootguard、health、rollback |
+| XeMTL | XeGfx 0.0.35 plugin · `497d521e` | `0005 → 0006 → 0007` | Metal 插件、host import、first-loss journal |
+
+每条补丁链按表中顺序应用。完整文件范围、应用命令与依赖关系见 [patches/README.md](patches/README.md)。
 
 ## 构建与试验
 
-1. 克隆 [watchthelight-labs/NvGfx 的 xe 分支](https://github.com/watchthelight-labs/NvGfx/tree/xe)。
-2. core 检出 `5a19a73f`，先应用 `0001` 到 `0004`。
-3. 在同一 core 树继续应用 `0008` 到 `0010`，再按顺序叠加 `0011` 到 `0022`。其中 `0013` 需要用 `patch -E` 删除已经清空的旧时序头文件。
-4. plugin 检出 `497d521e`，依次应用 `0005` 到 `0007`。
-5. 使用 `build/nvgfx/build_xegfx.sh` 构建 XeGfx core。
-6. 使用对应构建入口生成 XeGfxAccel、XeGfxIntelFB、NVRMAGDC 与 XeMTL。
-7. 使用 `scripts/install_core_044.py`、`install_upstream_accel.py` 与 `install_xeintelfb.py` 安装并重建 AuxKC；0016 另外提供原生显示链的安装、preflight、bootguard、health 与 rollback 工具。
-8. 早期链路可以继续用 `scripts/run_upstream_trial4.sh` 做分阶段验证；当前 K9 手动 bring-up 使用 `scripts/run_upstream_trial5.sh`，`scripts/resume-bringup.sh` 则把 core、head 4、display-pipe、K9 sysctl 与单次 WindowServer 重启串成完整恢复流程。
-9. 使用 `debug.xegfxaccel_iop_xe_flip=1` 进入 GGTT 零拷贝路径；K9 另外打开 `debug.xegfxaccel_iop_xe_defer=1`，并观察 `iop_xe_flips`、`iop_xe_flip_miss`、`iop_xe_flip_fail`、`defer_armed` 与 `defer_signals`。
-10. 使用 `scripts/soak_userptr_test.sh` 做 userptr 长压测，使用 `scripts/tools/display_probe.c` 检查刷新节拍。仓库内脚本通过自身位置寻找同仓库文件，仓库外源码与构建产物统一使用 `XEGFX_*` 环境变量指定。
+1. 准备 NvGfx `xe` 的两个源码基点：`5a19a73f` 用于 XeGfx core 与显示 kext，`497d521e` 用于 XeMTL plugin。
+2. 按“补丁结构”中的组件链应用补丁。core、accel、IntelFB、AGDC 与 XeGfxDisplay 在 0.0.44 源码树中构建；XeMTL 在 0.0.35 的 `plugin/` 树中构建。
+3. 使用 `build/nvgfx/build_xegfx.sh` 构建 XeGfx core，使用对应构建入口生成 XeGfxAccel、XeGfxIntelFB 与 XeGfxAGDC，使用 `tools/build-xegfxdisplay.sh` 构建 XeGfxDisplay。
+4. 使用 `build/nvgfx/build_xlate.sh` 与 `build/nvgfx/build_plugin.sh` 生成 translator 与 `XeMTLDriver.bundle`。
+5. 0016 工具集负责 kext 产物检查、安装、AuxKC 重建、boot-arm 配置、preflight、health 与 rollback。仓库外源码树和构建产物通过 `XEGFX_*` 环境变量传入。
+6. 重启后的验证顺序对应启动链：XeGfx stage 1–7、`XeGfxDisplayNub`、EDID/DPCD、K1 eDP 状态、XeGfxDisplay framebuffer/scanout、XeGfxAccel、AGDC/K5、WindowServer Metal 与 display-pipe。
+7. 图形稳定性使用 `scripts/soak_userptr_test.sh`、display probe、bootguard/health 输出和统一日志进行检查。K1 当前验证范围为 eDP 状态读取与管线恢复，后续 modeset 继续沿同一链路推进。
 
-完整构建说明见 [docs/building.md](docs/building.md)。
+完整构建、安装与验证说明见 [docs/building.md](docs/building.md)。
 
 ## 文档
 
