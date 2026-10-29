@@ -1,0 +1,418 @@
+# 0020 core: read the internal panel's EDID and DPCD over its AUX channel and publish them on the nub
+#
+# Base:  NvGfx core 94278c72 (0.0.44 + 0001/0008 + 0011)
+# Files: gpu/xkpi/src/i915/xg_display_hook.c, gpu/xkpi/src/i915/xg_display_hook.h, gpu/xegfx/shim/src/xnu/xg_kext.cpp
+# Apply: patch -p1 < patches/0020-core-aux-edid-dpcd.patch
+#
+# Problem: macOS saw the panel as "Unknown Display" (vendor 'unkn', product 0x717): nothing ever read the EDID,
+# and the link/DSC capabilities 240 Hz depends on were unknown.
+# Fix: the way NVKMS hands NVRMFB its EDID, core reads it from the panel before publishing XeGfxDisplayNub.  The
+# i915 display is left alone, so the AUX registers are driven with intel_dp_aux_xfer()'s display-version-14
+# sequence (POWER_REQUEST + 600 us, SEND_BUSY|DONE|errors|size|sync 18/32, poll, clear sticky bits, retries).
+# The channel comes from the VBT's internal child (aux 0x40 -> 0x64010); PSR enabled refuses the read.  DPCD
+# 0x000/0x060/0x070/0x2200/0x700 and the EDID (I2C-over-AUX at 0x50, segment pointer 0x30, checksums) become
+# "xegfx-dpcd" / "xegfx-edid"; NVRAM xegfx-disp-noaux skips it.  Measured: EDID 384 B BOE 0x0D55, DPCD 1.4,
+# HBR3 x4, 8b/10b only (no UHBR), DSC 1.2, AUX backlight capable.
+#
+--- a/gpu/xkpi/src/i915/xg_display_hook.c
++++ b/gpu/xkpi/src/i915/xg_display_hook.c
+@@ -78,6 +78,7 @@
+ 
+ 	gXgDispDumpLen = 0;
+ 	gXgDispDump[0] = '\0';
++	xg_display_aux_set_display(display);	/* the nub's AUX read needs it after intel_bios_init() */
+ 
+ 	snprintf(line, sizeof(line), "level=%d", xg_display_disp_level());
+ 	xg_disp_line(display, line);
+@@ -875,4 +876,313 @@
+ 	    a.surface_id, a.phys, a.pitch, a.length, a.reserved,
+ 	    (alloc_ok && get_ok && free_ok && free2_ok && realloc_ok) ? "PASS" : "FAIL");
+ 	return ((int)strlen(out));
++}
++
++/*
++ * Panel identity over the internal panel's AUX channel, the way NVKMS hands NVRMFB its EDID: read-only DPCD and
++ * EDID (I2C-over-AUX), captured once before the display nub is published and handed to the adapter as OSData.
++ *
++ * The i915 display engine is left alone (no encoders, no power-domain bookkeeping), so this talks to the AUX
++ * registers directly with the sequence intel_dp_aux_xfer() uses on display version 14 (MTL/ARL): request the AUX
++ * power (XELPDP_DP_AUX_CH_CTL_POWER_REQUEST, fixed 600 us), keep that bit set in every send, poll DONE instead of
++ * taking the AUX interrupt, clear the sticky status bits after each message.  Only read transactions are sent to
++ * the sink; nothing touches the link, the pipe or the panel power sequencer.  It refuses to run while PSR owns the
++ * AUX channel, and any failure leaves the capture empty (the adapter then reports no EDID, as before).
++ */
++#include <linux/delay.h>
++#include "intel_de.h"
++#include "intel_dp_aux_regs.h"
++
++#define XG_AUX_PSR_CTL		0x60800		/* EDP_PSR_CTL(TRANSCODER_A), EDP_PSR_ENABLE = bit 31 */
++#define XG_AUX_PSR2_CTL		0x60900		/* EDP_PSR2_CTL(TRANSCODER_A), EDP_PSR2_ENABLE = bit 31 */
++#define XG_AUX_REPLY_ACK	0x0
++#define XG_AUX_REPLY_DEFER	0x2
++#define XG_AUX_NATIVE_READ	0x9
++#define XG_AUX_I2C_WRITE	0x0
++#define XG_AUX_I2C_READ		0x1
++#define XG_AUX_I2C_MOT		0x4
++#define XG_DDC_ADDR		0x50
++#define XG_DDC_SEGMENT_ADDR	0x30
++
++static struct intel_display	*gXgAuxDisplay;
++static unsigned int		gXgAuxCtl;		/* AUX_CH_CTL offset; data registers follow at +4 */
++static unsigned char		gXgEdid[XG_DISPLAY_MAX_EDID];
++static unsigned int		gXgEdidLen;
++static unsigned char		gXgDpcd[XG_DISPLAY_DPCD_BYTES];
++static int			gXgDpcdOk;
++static char			gXgAuxWhy[128] = "not run";
++
++void
++xg_display_aux_set_display(struct intel_display *display)
++{
++	gXgAuxDisplay = display;
++}
++
++static u32
++xg_aux_rd(unsigned int off)
++{
++	return (intel_de_read(gXgAuxDisplay, _MMIO(off)));
++}
++
++static void
++xg_aux_wr(unsigned int off, u32 v)
++{
++	intel_de_write(gXgAuxDisplay, _MMIO(off), v);
++}
++
++/* one AUX message: send <= 20 bytes, receive <= 20; returns the received byte count or -errno */
++static int
++xg_aux_xfer(const u8 *tx, int txn, u8 *rx, int rxmax)
++{
++	u32 status = 0, send;
++	int i, j, try, wait, n;
++
++	for (try = 0; try < 3; try++) {
++		status = xg_aux_rd(gXgAuxCtl);
++		if ((status & DP_AUX_CH_CTL_SEND_BUSY) == 0)
++			break;
++		msleep(1);
++	}
++	if (status & DP_AUX_CH_CTL_SEND_BUSY)
++		return (-EBUSY);
++	send = DP_AUX_CH_CTL_SEND_BUSY | DP_AUX_CH_CTL_DONE | DP_AUX_CH_CTL_TIME_OUT_ERROR |
++	    DP_AUX_CH_CTL_TIME_OUT_MAX | DP_AUX_CH_CTL_RECEIVE_ERROR | DP_AUX_CH_CTL_MESSAGE_SIZE(txn) |
++	    DP_AUX_CH_CTL_FW_SYNC_PULSE_SKL(18) | DP_AUX_CH_CTL_SYNC_PULSE_SKL(32) |
++	    XELPDP_DP_AUX_CH_CTL_POWER_REQUEST;
++	for (try = 0; try < 5; try++) {
++		for (i = 0; i < txn; i += 4) {
++			u32 v = 0;
++			for (j = 0; j < 4 && i + j < txn; j++)
++				v |= (u32)tx[i + j] << ((3 - j) * 8);
++			xg_aux_wr(gXgAuxCtl + 4 + i, v);
++		}
++		xg_aux_wr(gXgAuxCtl, send);
++		for (wait = 0; wait < 1000; wait++) {		/* 10 ms, as intel_dp_aux_wait_done() */
++			status = xg_aux_rd(gXgAuxCtl);
++			if ((status & DP_AUX_CH_CTL_SEND_BUSY) == 0)
++				break;
++			udelay(10);
++		}
++		xg_aux_wr(gXgAuxCtl, status | DP_AUX_CH_CTL_DONE | DP_AUX_CH_CTL_TIME_OUT_ERROR |
++		    DP_AUX_CH_CTL_RECEIVE_ERROR);
++		if (status & DP_AUX_CH_CTL_SEND_BUSY)
++			return (-ETIMEDOUT);
++		if (status & DP_AUX_CH_CTL_TIME_OUT_ERROR)
++			continue;
++		if (status & DP_AUX_CH_CTL_RECEIVE_ERROR) {
++			usleep_range(400, 500);
++			continue;
++		}
++		if (status & DP_AUX_CH_CTL_DONE)
++			break;
++	}
++	if ((status & DP_AUX_CH_CTL_DONE) == 0 || (status & (DP_AUX_CH_CTL_TIME_OUT_ERROR | DP_AUX_CH_CTL_RECEIVE_ERROR)))
++		return (-EIO);
++	n = REG_FIELD_GET(DP_AUX_CH_CTL_MESSAGE_SIZE_MASK, status);
++	if (n == 0 || n > 20)
++		return (-EIO);
++	if (n > rxmax)
++		n = rxmax;
++	for (i = 0; i < n; i += 4) {
++		u32 v = xg_aux_rd(gXgAuxCtl + 4 + i);
++		for (j = 0; j < 4 && i + j < n; j++)
++			rx[i + j] = (u8)(v >> ((3 - j) * 8));
++	}
++	return (n);
++}
++
++/* native DPCD read of up to 16 bytes, with the DEFER retries drm_dp_dpcd_access() does */
++static int
++xg_aux_dpcd_read(unsigned int addr, u8 *buf, int len)
++{
++	u8 tx[4] = { (u8)((XG_AUX_NATIVE_READ << 4) | ((addr >> 16) & 0xf)), (u8)(addr >> 8), (u8)addr, (u8)(len - 1) };
++	u8 rx[20];
++	int try, n;
++
++	for (try = 0; try < 32; try++) {
++		n = xg_aux_xfer(tx, sizeof(tx), rx, 1 + len);
++		if (n < 0)
++			return (n);
++		if (((rx[0] >> 4) & 0x3) == XG_AUX_REPLY_DEFER) {
++			usleep_range(400, 500);
++			continue;
++		}
++		if (((rx[0] >> 4) & 0x3) != XG_AUX_REPLY_ACK || n - 1 < len)
++			return (-EIO);
++		memcpy(buf, rx + 1, len);
++		return (len);
++	}
++	return (-EAGAIN);
++}
++
++/* one I2C-over-AUX message; data/len only for writes, len bytes back for reads; returns bytes moved or -errno */
++static int
++xg_aux_i2c(u8 req, u8 i2c_addr, const u8 *wdata, u8 *rdata, int len)
++{
++	u8 tx[5], rx[20];
++	int try, n, txn;
++
++	tx[0] = (u8)(req << 4);
++	tx[1] = 0;
++	tx[2] = i2c_addr;
++	if (len == 0) {
++		txn = 3;				/* address-only: start/stop the I2C transaction */
++	} else {
++		tx[3] = (u8)(len - 1);
++		txn = 4;
++		if (wdata != NULL) {
++			tx[4] = wdata[0];		/* writes here are a single offset/segment byte */
++			txn = 5;
++		}
++	}
++	for (try = 0; try < 32; try++) {
++		n = xg_aux_xfer(tx, txn, rx, 1 + 16);
++		if (n < 0)
++			return (n);
++		if (((rx[0] >> 4) & 0x3) == XG_AUX_REPLY_DEFER || ((rx[0] >> 6) & 0x3) == XG_AUX_REPLY_DEFER) {
++			usleep_range(400, 500);
++			continue;
++		}
++		if (((rx[0] >> 4) & 0x3) != XG_AUX_REPLY_ACK || ((rx[0] >> 6) & 0x3) != XG_AUX_REPLY_ACK)
++			return (-EIO);
++		if (rdata != NULL && len > 0) {
++			if (n - 1 <= 0)
++				continue;		/* a short reply carries no data yet: ask again */
++			memcpy(rdata, rx + 1, n - 1);
++			return (n - 1);
++		}
++		return (len);
++	}
++	return (-EAGAIN);
+ }
++
++/* one 128-byte EDID block through E-DDC (segment pointer at 0x30 for blocks 2 and up) */
++static int
++xg_aux_edid_block(unsigned int block, u8 *out)
++{
++	u8 seg = (u8)(block / 2), off = (u8)((block % 2) * 128);
++	int got = 0, n, rc = 0;
++
++	if (seg != 0 && xg_aux_i2c(XG_AUX_I2C_WRITE | XG_AUX_I2C_MOT, XG_DDC_SEGMENT_ADDR, &seg, NULL, 1) < 0)
++		rc = -EIO;
++	if (rc == 0 && xg_aux_i2c(XG_AUX_I2C_WRITE | XG_AUX_I2C_MOT, XG_DDC_ADDR, &off, NULL, 1) < 0)
++		rc = -EIO;
++	while (rc == 0 && got < 128) {
++		n = xg_aux_i2c(XG_AUX_I2C_READ | XG_AUX_I2C_MOT, XG_DDC_ADDR, NULL, out + got, 128 - got < 16 ? 128 - got : 16);
++		if (n <= 0)
++			rc = n < 0 ? n : -EIO;
++		else
++			got += n;
++	}
++	(void)xg_aux_i2c(XG_AUX_I2C_READ, XG_DDC_ADDR, NULL, NULL, 0);	/* stop, also after a failure */
++	return (rc);
++}
++
++static int
++xg_edid_block_ok(const u8 *b, int base)
++{
++	static const u8 hdr[8] = { 0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0 };
++	unsigned int i, sum = 0;
++
++	if (base && memcmp(b, hdr, sizeof(hdr)) != 0)
++		return (0);
++	for (i = 0; i < 128; i++)
++		sum += b[i];
++	return ((sum & 0xff) == 0);
++}
++
++int
++xg_display_aux_probe(void)
++{
++	static const unsigned int regions[XG_DISPLAY_DPCD_BYTES / 16] = { 0x000, 0x060, 0x070, 0x2200, 0x700 };
++	const unsigned char *c = NULL;
++	char line[192];
++	unsigned int i, aux = 0, ext;
++	u32 ctl, psr, psr2;
++	int rc;
++
++	gXgEdidLen = 0;
++	gXgDpcdOk = 0;
++	if (gXgAuxDisplay == NULL) {
++		snprintf(gXgAuxWhy, sizeof(gXgAuxWhy), "no display (VBT not parsed)");
++		return (-ENODEV);
++	}
++	/* the internal panel's child device decides the channel; nothing is assumed about the port */
++	for (i = 0; i < (unsigned int)gXgChildCount; i++) {
++		const unsigned char *k = gXgChildData + i * gXgChildStride;
++		if (gXgChildSize >= 26 && (xg_kms_vbt_u16(k, 2) & (1U << 12))) {
++			c = k;
++			break;
++		}
++	}
++	if (c != NULL)
++		aux = xg_kms_vbt_u8(c, 25);
++	if (aux == 0x40)		/* DP_AUX_A */
++		gXgAuxCtl = 0x64010;
++	else if (aux == 0x10)		/* DP_AUX_B */
++		gXgAuxCtl = 0x64110;
++	else {
++		snprintf(gXgAuxWhy, sizeof(gXgAuxWhy), "internal panel aux 0x%x not a combo-PHY channel (child %s)",
++		    aux, c ? "found" : "missing");
++		goto out;
++	}
++	psr = xg_aux_rd(XG_AUX_PSR_CTL);
++	psr2 = xg_aux_rd(XG_AUX_PSR2_CTL);
++	if ((psr | psr2) & (1U << 31)) {
++		snprintf(gXgAuxWhy, sizeof(gXgAuxWhy), "PSR owns the AUX channel (psr 0x%08x psr2 0x%08x): not read", psr, psr2);
++		goto out;
++	}
++	ctl = xg_aux_rd(gXgAuxCtl);
++	if (!(ctl & XELPDP_DP_AUX_CH_CTL_POWER_REQUEST)) {
++		xg_aux_wr(gXgAuxCtl, ctl | XELPDP_DP_AUX_CH_CTL_POWER_REQUEST);
++		usleep_range(600, 1200);	/* xelpdp_aux_power_well_enable(): the status bit is not reliable */
++	}
++	for (i = 0; i < XG_DISPLAY_DPCD_BYTES / 16; i++) {
++		rc = xg_aux_dpcd_read(regions[i], gXgDpcd + i * 16, 16);
++		if (rc < 0 && i == 0) {
++			snprintf(gXgAuxWhy, sizeof(gXgAuxWhy), "DPCD 0x000 read failed (%d, ctl 0x%08x)", rc, xg_aux_rd(gXgAuxCtl));
++			goto out;
++		}
++		if (rc < 0)
++			memset(gXgDpcd + i * 16, 0, 16);	/* optional region: absent reads as zero */
++	}
++	gXgDpcdOk = 1;
++	rc = xg_aux_edid_block(0, gXgEdid);
++	if (rc < 0 || !xg_edid_block_ok(gXgEdid, 1)) {
++		snprintf(gXgAuxWhy, sizeof(gXgAuxWhy), "EDID block 0 %s (%d)", rc < 0 ? "read failed" : "invalid", rc);
++		goto out;
++	}
++	gXgEdidLen = 128;
++	ext = gXgEdid[126];
++	for (i = 1; i <= ext && (i + 1) * 128 <= sizeof(gXgEdid); i++) {
++		if (xg_aux_edid_block(i, gXgEdid + i * 128) < 0 || !xg_edid_block_ok(gXgEdid + i * 128, 0))
++			break;			/* keep the valid prefix */
++		gXgEdidLen = (i + 1) * 128;
++	}
++	snprintf(gXgAuxWhy, sizeof(gXgAuxWhy), "ok: aux 0x%x ctl 0x%x, EDID %u of %u byte(s)", aux, gXgAuxCtl,
++	    gXgEdidLen, (ext + 1) * 128);
++out:
++	snprintf(line, sizeof(line), "aux: %s", gXgAuxWhy);
++	xg_disp_line(gXgAuxDisplay, line);
++	if (gXgDpcdOk) {
++		snprintf(line, sizeof(line), "dpcd: rev 0x%02x max_rate 0x%02x lanes 0x%02x edp 0x%02x dsc 0x%02x ext 0x%02x/0x%02x/0x%02x edp_cap 0x%02x/0x%02x/0x%02x",
++		    gXgDpcd[0], gXgDpcd[1], gXgDpcd[2], gXgDpcd[0x0d], gXgDpcd[16], gXgDpcd[48], gXgDpcd[49], gXgDpcd[50],
++		    gXgDpcd[64], gXgDpcd[65], gXgDpcd[66]);
++		xg_disp_line(gXgAuxDisplay, line);
++	}
++	return (gXgEdidLen ? 0 : -EIO);
++}
++
++unsigned int
++xg_display_edid_get(const void **data)
++{
++	*data = gXgEdid;
++	return (gXgEdidLen);
++}
++
++unsigned int
++xg_display_dpcd_get(const void **data)
++{
++	*data = gXgDpcd;
++	return (gXgDpcdOk ? XG_DISPLAY_DPCD_BYTES : 0);
++}
+--- a/gpu/xkpi/src/i915/xg_display_hook.h
++++ b/gpu/xkpi/src/i915/xg_display_hook.h
+@@ -29,6 +29,18 @@
+ int xg_display_children_get(const void **data, unsigned int *child_size);
+ 
+ /*
++ * Panel identity read over the internal panel's AUX channel (read-only DPCD + EDID through I2C-over-AUX), captured
++ * before the nub is published.  DPCD is five 16-byte regions in this order: 0x000, 0x060 (DSC), 0x070 (PSR),
++ * 0x2200 (extended receiver caps), 0x700 (eDP caps).  A failed read leaves the EDID empty.
++ */
++#define XG_DISPLAY_MAX_EDID		512
++#define XG_DISPLAY_DPCD_BYTES		80
++void xg_display_aux_set_display(struct intel_display *display);
++int xg_display_aux_probe(void);
++unsigned int xg_display_edid_get(const void **data);
++unsigned int xg_display_dpcd_get(const void **data);
++
++/*
+  * M3b: read-only KMS KAPI v1.
+  *
+  * The KAPI is a static, fully const function table in this kext.  The nub
+--- a/gpu/xegfx/shim/src/xnu/xg_kext.cpp
++++ b/gpu/xegfx/shim/src/xnu/xg_kext.cpp
+@@ -45,6 +45,9 @@
+ unsigned int xg_display_kms_kapi_size(void);
+ unsigned int xg_display_kms_kapi_version(void);
+ void xg_display_set_measured_timing(const void *data, unsigned int len);
++int xg_display_aux_probe(void);
++unsigned int xg_display_edid_get(const void **data);
++unsigned int xg_display_dpcd_get(const void **data);
+ kern_return_t _start(kmod_info_t *ki, void *d);
+ kern_return_t _stop(kmod_info_t *ki, void *d);
+ KMOD_EXPLICIT_DECL(org.watchthelight.XeGfx, "0.0.32", _start, _stop)
+@@ -556,6 +559,8 @@
+  * M2/M3 grow this into the NVKMS-style kapi table.  Only called from the display overlay
+  * when disp_level >= 2, so nothing here runs on a normal boot.
+  */
++static bool xg_nvram_flag(const char *key);
++
+ extern "C" void
+ xg_display_nub_publish(int child_devices, int bdb_blocks)
+ {
+@@ -676,7 +681,34 @@
+ 			    (unsigned long long)xg_display_kms_kapi_size(), 32);
+ 		}
+ 	}
+-	if (OSString *ver = OSString::withCString("0.4-m3b")) {
++	/*
++	 * Panel identity, read from the panel itself over its AUX channel (as NVKMS gives NVRMFB its EDID): the raw
++	 * EDID for the adapter's getDDCBlock and the DPCD capability regions for link/DSC/backlight decisions.
++	 * NVRAM xegfx-disp-noaux skips the read; a failed read publishes nothing.
++	 */
++	if (xg_nvram_flag("xegfx-disp-noaux")) {
++		IOLog("XeGfx: display nub: AUX read skipped (NVRAM xegfx-disp-noaux)\n");
++	} else {
++		const void *edid = NULL, *dpcd = NULL;
++		unsigned int edid_len, dpcd_len;
++		(void)xg_display_aux_probe();
++		edid_len = xg_display_edid_get(&edid);
++		dpcd_len = xg_display_dpcd_get(&dpcd);
++		if (edid_len >= 128 && edid != NULL) {
++			if (OSData *d = OSData::withBytes(edid, edid_len)) {
++				nub->setProperty("xegfx-edid", d);
++				d->release();
++			}
++		}
++		if (dpcd_len > 0 && dpcd != NULL) {
++			if (OSData *d = OSData::withBytes(dpcd, dpcd_len)) {
++				nub->setProperty("xegfx-dpcd", d);
++				d->release();
++			}
++		}
++		IOLog("XeGfx: display nub: AUX EDID %u B, DPCD %u B\n", edid_len, dpcd_len);
++	}
++	if (OSString *ver = OSString::withCString("0.5-aux-edid")) {
+ 		nub->setProperty("xegfx-display-version", ver);
+ 		ver->release();
+ 	}

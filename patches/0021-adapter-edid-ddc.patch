@@ -1,0 +1,140 @@
+# 0021 XeGfxDisplay: serve the panel EDID and answer the connection attributes as NVRMFB does
+#
+# Base:  the adapter after 0018
+# Files: kexts/XeGfxDisplay/src/XeGfxDisplay.h, kexts/XeGfxDisplay/src/XeGfxDisplay.cpp
+# Apply: patch -p1 < patches/0021-adapter-edid-ddc.patch
+#
+# Problems, found in order:
+# 1. fConn.edid was never filled, so hasDDCConnect() was false.  loadNubEdid() copies "xegfx-edid" after
+#    kapiInit() and takes the physical size from it.
+# 2. getDDCBlock() only answered block 0; IODisplay asks 1-based blocks (as NVRMFB answers).
+# 3. kConnectionSupportsAppleSense was offered, so IODisplay used a generic built-in sense identity; NVRMFB
+#    answers it unsupported, reports kIOConnectionBuiltIn, and answers HLDDCSense through the return code.
+# 4. IODisplay::readFramebufferEDID() (disassembled from IOGraphicsFamily) asks 'hddc' with value == NULL and
+#    gives up on any error; the adapter rejected a NULL value with kIOReturnBadArgument, so no EDID was ever read.
+#    The value is now written only when non-NULL.
+# Result: AppleDisplay carries IODisplayEDID, identity BOE 0x9E5/0xD55, built-in, colour profile loaded.
+#
+--- a/kexts/XeGfxDisplay/src/XeGfxDisplay.h
++++ b/kexts/XeGfxDisplay/src/XeGfxDisplay.h
+@@ -406,6 +406,7 @@
+     /* ---- phases ------------------------------------------------------ */
+     bool     readKapi(IOService *provider);      /* M1 */
+     bool     kapiInit();                         /* M1 + head claim */
++    void     loadNubEdid(IOService *provider);   /* panel EDID the core read over AUX */
+     bool     buildModeTable();                   /* M2 */
+     bool     buildMeasuredModeTable(const void *bytes, uint32_t length); /* M3a */
+     void     logMeasuredModes() const;                                  /* M3a */
+--- a/kexts/XeGfxDisplay/src/XeGfxDisplay.cpp
++++ b/kexts/XeGfxDisplay/src/XeGfxDisplay.cpp
+@@ -2269,20 +2269,28 @@
+ XeGfxFramebuffer::getAttributeForConnection(IOIndex connectIndex,
+                                             IOSelect attribute, uintptr_t *value)
+ {
+-    if (connectIndex != 0 || !value)
++    if (connectIndex != 0)
+         return kIOReturnBadArgument;
+ 
++    /*
++     * As NVRMFB answers: IOGraphics reads the return code, not the value, and IODisplay::readFramebufferEDID()
++     * asks kConnectionSupportsHLDDCSense with value == NULL (a NULL value used to fail the whole EDID read with
++     * kIOReturnBadArgument).  DDC is "supported" exactly when there is an EDID, and Apple sense is never offered
++     * on a connection, so IODisplay takes the display's identity from the EDID instead of a generic built-in
++     * sense code (vendor 'unkn' product 0x717).  getAppleSense() itself still answers for the internal panel.
++     */
+     switch (attribute) {
++    case kConnectionFlags:
++        if (value)
++            *value = (fConn.caps & XEGFX_CONN_CAP_INTERNAL) ? kIOConnectionBuiltIn : 0;
++        return kIOReturnSuccess;
+     case kConnectionSupportsHLDDCSense:
++        if (value)
++            *value = 1;
++        return hasDDCConnect(0) ? kIOReturnSuccess : kIOReturnUnsupported;
+     case kConnectionSupportsLLDDCSense:
+-        *value = hasDDCConnect(0) ? 1 : 0;
+-        return kIOReturnSuccess;
+     case kConnectionSupportsAppleSense:
+-        *value = (fConn.caps & XEGFX_CONN_CAP_INTERNAL) ? 1 : 0;
+-        return kIOReturnSuccess;
+     case kConnectionDisplayParameterCount:
+-        *value = 0;
+-        return kIOReturnSuccess;
+     case kConnectionDisplayParameters:
+         return kIOReturnUnsupported;
+     default:
+@@ -2339,19 +2347,51 @@
+                               IOSelect blockType, IOOptionBits options,
+                               UInt8 *data, IOByteCount *length)
+ {
++    /* blockNumber is 1-based, as IODisplay asks and NVRMFB answers */
+     if (connectIndex != 0 || blockType != kIODDCBlockTypeEDID ||
+-        !data || !length || *length < 128)
++        blockNumber == 0 || blockNumber * 128u > fConn.edidSize)
++        return kIOReturnUnsupported;
++    if (!data || !length || *length < 128)
+         return kIOReturnBadArgument;
+-    if (blockNumber != 0)
+-        return kIOReturnUnsupported;          /* EDID base block only */
+-    if (fConn.edidSize < 128)
+-        return kIOReturnNoDevice;
+ 
+-    memcpy(data, fConn.edid, 128);
++    memcpy(data, fConn.edid + (blockNumber - 1) * 128u, 128);
+     *length = 128;
+     return kIOReturnSuccess;
+ }
+ 
++/*
++ * The core reads the panel's EDID over its AUX channel before it publishes the nub ("xegfx-edid", whole 128-byte
++ * blocks, checksums already verified), the same way NVKMS hands NVRMFB its EDID.  No EDID keeps the old behaviour:
++ * hasDDCConnect() stays false.  The EDID's image size fills in a physical size the VBT does not carry.
++ */
++void
++XeGfxFramebuffer::loadNubEdid(IOService *provider)
++{
++    OSData *e = OSDynamicCast(OSData, provider->getProperty("xegfx-edid"));
++    unsigned n = e ? e->getLength() : 0;
++
++    n -= n % 128u;
++    if (n > sizeof fConn.edid)
++        n = sizeof fConn.edid;
++    if (n < 128) {
++        XLOG("edid: none on the nub; DDC stays off");
++        return;
++    }
++    memcpy(fConn.edid, e->getBytesNoCopy(), n);
++    fConn.edidSize = (uint16_t)n;
++    const uint8_t *b = fConn.edid;
++    unsigned wmm = b[66] | ((b[68] & 0xf0u) << 4), hmm = b[67] | ((b[68] & 0x0fu) << 8);   /* first detailed timing */
++    if (!wmm || !hmm) { wmm = b[21] * 10u; hmm = b[22] * 10u; }                             /* basic block, in cm */
++    if (!fConn.panelWidthMm && wmm && hmm) {
++        fConn.panelWidthMm  = (uint16_t)wmm;
++        fConn.panelHeightMm = (uint16_t)hmm;
++    }
++    XLOG("edid: %u byte(s) from the panel, vendor %c%c%c product 0x%04x, %ux%u mm",
++         n, '@' + ((b[8] >> 2) & 0x1f), '@' + (((b[8] & 3) << 3) | (b[9] >> 5)), '@' + (b[9] & 0x1f),
++         (unsigned)(b[10] | (b[11] << 8)), fConn.panelWidthMm, fConn.panelHeightMm);
++    setProperty("xegfx-edid-bytes", (unsigned long long)n, 32);
++}
++
+ /* ======================================================================= */
+ /* The accel-facing API: flip / scanout / vram                              */
+ /* ======================================================================= */
+@@ -2725,6 +2765,7 @@
+         return false;
+     if (!kapiInit())
+         return false;
++    loadNubEdid(provider);
+     if (!buildModeTable()) {
+         XLOG("empty mode table");
+         return false;
+@@ -2978,6 +3019,8 @@
+      * unless the M3d expose arm is chosen and the preflight is green.
+      */
+     bool kapiOk = readKapi(provider) && kapiInit();
++    if (kapiOk)
++        loadNubEdid(provider);
+     if (!kapiOk) {
+         XLOG("S3: check (a) FAILED during preflight; registering an INERT "
+              "framebuffer -- open denied, no mode, no property, no NVRAM write "
