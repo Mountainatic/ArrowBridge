@@ -1,0 +1,1878 @@
+# 0012 XeGfxAccel: adapter <-> accelerator present contract (M3d) and boot-armed auto-configuration (M4a)
+#
+# Base:  kexts/NVRM/accel after 0002 + 0009 (NvGfx xe 0.0.44)
+# Files: kexts/NVRM/accel/nvrm-accel.cpp, kexts/NVRM/accel/nvaccel_stubs.h, kexts/NVRM/accel/xegfx_accel_names.h,
+#        kexts/NVRM/accel/xe/Info.plist
+# Apply: patch -p1 < patches/0012-accel-m3d-m4a-present-bootarm.patch
+#
+# - M3d: the KMS adapter owns the mode and the scanout, the accelerator keeps the plane registers.  Through
+#   callPlatformFunction the accelerator asks the framebuffer for "xgGetScanoutInfo" and imports it as the
+#   display-pipe resource (first composited frame is a zero-copy flip of the adapter's memory); the framebuffer
+#   calls back "xgFlipPresent", "xgVblankCount", "xgVblankTime", "xgGetPresentInfo", "xgCursorImage".  Every
+#   struct is a fixed 64-bit layout led by version and size, checked on both sides.
+# - M4a: a kernel thread (a thread_call cannot IOSleep) runs igpu -> fb=1 -> head -> fb=3 -> pipe -> iop -> flip
+#   at boot, with bounded waits (3 s delay, 30 s head, 25 s pipe, 90 s total), and leaves XeGfxAccelAgdcRequest on
+#   the GPU's PCI node for AGDC, because it cannot write another kext's sysctls.  The state, the step mask and the
+#   arm reason are readable for the boot guard.
+#
+--- a/kexts/NVRM/accel/nvaccel_stubs.h
++++ b/kexts/NVRM/accel/nvaccel_stubs.h
+@@ -18,6 +18,9 @@
+     OSDeclareDefaultStructors(NVResource)
+     NM_TAHOE_FWD(NVResource)
+ public:
++#ifdef NMX_XEGFX
++    bool init(IOGraphicsAccelerator2*, IOAccelShared2*, unsigned int) APPLE_KEXT_OVERRIDE;
++#endif
+     unsigned int fPbLogged = 0;
+     void rebuildPagingBuffer() APPLE_KEXT_OVERRIDE { if (fPbLogged < 4) { fPbLogged++; ALOG("NVResource::rebuildPagingBuffer -- nothing to rebuild until there are page tables (rung 5)"); } }
+     uint64_t getLevelOffset(unsigned char a0, unsigned char a1, int* a2) APPLE_KEXT_OVERRIDE {
+@@ -106,6 +109,9 @@
+     bool copyToBuffer(int a0, int a1, int a2, int a3, unsigned int a4, unsigned int a5, IOAccelEvent* a6, IOAccelResource2* a7, IOAccelSysMemory* a8, unsigned int a9, unsigned long long a10, unsigned int a11) APPLE_KEXT_OVERRIDE { ALOG("NVSurface::copyToBuffer"); return false; }
+     void submitSwapCopy(IOAccelEvent* a0, IOAccelResource2* a1, IOAccelResource2* a2) APPLE_KEXT_OVERRIDE {
+         (void)a0;
++#ifdef NMX_XEGFX
++        if (nvAccelXeSwapCopy(a2)) return;
++#endif
+         nvAccelSwapProbe(a1, a2);
+         IOAccelResource2 *src = nvAccelResHasContent(a2) ? a2
+                               : nvAccelResHasContent(a1) ? a1 : nullptr;
+@@ -143,6 +149,9 @@
+     OSDeclareDefaultStructors(NVDisplayPipe)
+     NM_TAHOE_FWD(NVDisplayPipe)
+ public:
++#ifdef NMX_XEGFX
++    bool init(IOGraphicsAccelerator2*, IOAccelDisplayMachine*, IOFramebuffer*, unsigned int) APPLE_KEXT_OVERRIDE;
++#endif
+     IOAccelMemory *initFramebufferResource(unsigned int index, IOAccelResource2 *res) APPLE_KEXT_OVERRIDE;
+     IOReturn validateTransaction(IOAccelDisplayPipeTransaction2 *txn) APPLE_KEXT_OVERRIDE;
+     IOReturn performTransaction(IOAccelDisplayPipeTransaction2 *txn) APPLE_KEXT_OVERRIDE;
+--- a/kexts/NVRM/accel/nvrm-accel.cpp
++++ b/kexts/NVRM/accel/nvrm-accel.cpp
+@@ -37,6 +37,9 @@
+ static bool               nvAccelCopyToScanout(IOAccelResource2 *res);
+ void                      nvAccelSwapProbe(IOAccelResource2 *a1, IOAccelResource2 *a2);
+ bool                      nvAccelResHasContent(IOAccelResource2 *res);
++#ifdef NMX_XEGFX
++bool nvAccelXeSwapCopy(IOAccelResource2 *source);
++#endif
+ static void               nvAccelWriteStamp(int index, unsigned int value);
+ #ifdef NMX_ACCEL
+ #define NV_LOG_TAG "NMXAccel: "
+@@ -59,6 +62,8 @@
+ uint64_t mach_absolute_time(void);
+ void absolutetime_to_nanoseconds(uint64_t abstime, uint64_t *result);
+ void proc_selfname(char *buf, int size);
++// M4a: a real kernel thread (kern/thread.h is reachable here; only thread_call.h clashes).  The boot sequence
++// waits on the display stack with IOSleep, which a one-shot thread_call cannot do.
+ }
+ static volatile SInt64 gCntVmAlloc, gCntVmAllocBytes, gCntVmDealloc, gCntVmDeallocBytes, gCntVmRefused,
+                        gCntResNew, gCntResFree, gCntMapCommit, gCntMapRelease, gCntMapFree;
+@@ -69,6 +74,7 @@
+ static void nvXeTraceStart(void);
+ #endif
+ static int gNvAccelArmed = 0;
++static SInt64 gCntIopFlipHome, gCntIopLate;
+ // 1 once the headless check restored the plugin name without arming (no NVIDIA display head). The Metal plugin reads it:
+ // a headless GPU hands frames to another GPU's WindowServer through system memory, so IOSurfaces must be copied out.
+ static int gNvHeadless = 0;
+@@ -94,6 +100,102 @@
+ #endif
+ SYSCTL_INT(_debug, OID_AUTO, nvaccel_igpu, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, &gNvIgpu, 0,
+            "1 = give an Intel built-in panel (NMIntelFB, head 4) a display pipe on this accelerator");
++#ifdef NMX_XEGFX
++// --- M4a: boot-armed auto-configuration (docs/19-M4A-ACCEL.md) ---------------------------------------
++// gBootArmState: 0 idle, 1 a sequence is running, 2 ready, 3 failed.  gBootArmSteps: 1 igpu, 2 fb=1, 4 head
++// registered, 8 fb=3, 16 pipe, 32 iop, 64 flip, 128 the AGDC request was left behind.  gBootArmReason: 1 boot
++// argument, 2 IOResources property, 3 provider property, 4 debug.xegfxaccel_boot=1.
++static int gBootArmState = 0;
++static int gBootArmSteps = 0;
++static int gBootArmReason = 0;
++static int gBootArmDelayMs = 3000;      // AGDC and the display machine have their own early MMIO work to finish first
++static int gBootArmHeadWaitMs = 30000;  // a panel that has not published in 30 s does not come up this boot
++static int gBootArmPipeWaitMs = 25000;  // the family's sweep and the first mode change can be slow at boot
++static int gBootArmBudgetMs = 90000;    // hard cap for the whole sequence, whatever the individual waits say
++// --- M3d: the adapter <-> accelerator present contract (docs/20-M3D-ACCEL.md) ---------------------------------
++// The KMS adapter (XeGfxDisplay.kext, XeGfxFramebuffer) owns the mode and the scanout allocation, but the plane
++// registers are this accelerator's: core's KAPI keeps .flip == NULL (M3c), and xg_i915_flip.c's own header says
++// "The accelerator (XeGfxAccel) writes PLANE_SURF_1_A itself; this file only owns the GGTT side".  So the M3d
++// interface is two directions, both through callPlatformFunction:
++//   A) accelerator -> framebuffer  "xgGetScanoutInfo"  (p1 = struct XeGfxScanoutInfo *): the adapter's KAPI
++//      scanout block.  askFramebufferForScanout() imports it as the display-pipe resource, so the first composited
++//      frame is a zero-copy flip of the adapter's own memory (docs/12 S4 item 4).  NotReady = the adapter has no
++//      scanout yet: the pipe stays without a resource instead of being pointed at the boot aperture.
++//   B) framebuffer -> accelerator  "xgFlipPresent" (p1 = struct XeGfxPresent *), "xgVblankCount" (p1 = uint64_t
++//      *count, p2 = uint64_t *ns), "xgVblankTime" (p1 = uint64_t *ns, p2 = uint64_t *count), "xgGetPresentInfo"
++//      (p1 = struct XeGfxPresentInfo *), "xgCursorImage" (p1 = struct XeGfxCursorImage *, validate only).
++//      The adapter finds this object by the XeGfxAccelPresent property it publishes (see nvXePublishPresentAPI).
++// Every struct below is a fixed 64-bit layout whose first two words are version and size, and both sides check
++// them, so the ABI cannot drift silently.  Nothing here writes a display register unless the adapter calls
++// xgFlipPresent, and that call returns kIOReturnNotReady until the adapter has published XeGfxFbReady.
++#define NVXE_ABI_VERSION 2u
++#define NVXE_FORMAT_XRGB8888 0x42475241u   // the adapter's format word ('ARGB' in the FB's byte order)
++struct XeGfxScanoutInfo {                  // A: 80 bytes, version 2
++    unsigned int version;                  // NVXE_ABI_VERSION
++    unsigned int size;                     // sizeof (80)
++    unsigned long long phys;               // host physical of the KAPI scanout (< 4 GiB)
++    unsigned long long kva;                // kernel mapping of the same block (0 if none)
++    unsigned int pitch;                    // bytes per row, 256-byte aligned by the KAPI allocator
++    unsigned int width, height;            // active raster
++    unsigned int format;                   // NVXE_FORMAT_XRGB8888
++    unsigned int head;                     // 4 (this accelerator's panel head)
++    unsigned int flags;                    // NVXE_SCANOUT_* below
++    unsigned int activeScanout;            // adapter's index (0 when it has one scanout)
++    unsigned int scanoutCount;             // how many scanouts the adapter has handed out
++    unsigned long long vblankCount;        // adapter's own count (informational; accel answers xgVblankCount)
++    unsigned long long vblankNs;           // adapter's own timestamp, ns
++    unsigned int ggtt;                     // low 32 bits of the core GGTT offset of this block (0 = unknown)
++    unsigned int reserved;
++};
++#define NVXE_SCANOUT_READY 0x1u            // allocated backing importable; plane writes use FbReady
++#define NVXE_SCANOUT_GGTT  0x2u            // the ggtt word is usable (the adapter spells this bit ZEROCOPY); the accelerator only checks bit 0
++struct XeGfxPresent {                      // B: 80 bytes, version 1|2 (identical layout; the adapter sends 2 since 2026-10-28, 1 stays accepted)
++    unsigned int version;                  // 1 or NVXE_ABI_VERSION (2)
++    unsigned int size;                     // sizeof (80)
++    unsigned long long phys;               // frame physical (< 4 GiB) unless ggtt != 0
++    unsigned long long kva;                // frame CPU mapping (informational; never read here)
++    unsigned int ggtt;                     // GGTT offset of the frame (preferred: no PTE write), 0 = map phys
++    unsigned int pitch, width, height;     // bytes per row (>= 4*width, 4-aligned) and raster
++    unsigned int format;                   // NVXE_FORMAT_XRGB8888
++    unsigned int head;                     // 4 (0 is accepted as 4: adapter header says "4 (0 => 4)")
++    unsigned int regionX, regionY, regionW, regionH;  // 0 width/height = the whole frame
++    unsigned long long flipCount;          // the adapter's sequence number (informational)
++    unsigned int flags;                    // NVXE_PRESENT_* in, NVXE_PRESENT_RESULT_* out
++    unsigned int reserved;
++};
++#define NVXE_PRESENT_WAIT_LATCH   0x1u     // (in) wait for the panel to latch; flags==0 also waits (default)
++#define NVXE_PRESENT_NO_WAIT      0x2u     // (in) write and return immediately (interrupt-safe, no IOSleep); for version-1 requests bit 0 also means no-wait (the adapter's spelling)
++#define NVXE_PRESENT_DONE         0x4u     // (out) PLANE_SURF_1_A now points at this frame
++#define NVXE_PRESENT_LATCHED      0x8u     // (out) the panel latched it at a vblank
++#define NVXE_PRESENT_LATCH_TIMEOUT 0x10u   // (out) written but no vblank was seen: the previous frame was put back
++struct XeGfxPresentInfo {                  // B: 72 bytes, version 2 (diagnostics only)
++    unsigned int version;
++    unsigned int size;
++    unsigned long long phys;               // last frame this accelerator programmed
++    unsigned long long flipCount;          // how many presents this accelerator has programmed
++    unsigned long long vblankCount;
++    unsigned long long vblankNs;
++    unsigned int pitch, width, height, format, head;
++    unsigned int flags;                    // NVXE_PRESENT_RESULT_* plus NVXE_PRESENT_INFO_* below
++    unsigned int planeSurfGgtt;            // live read-back of PLANE_SURF_1_A
++    unsigned int reserved;
++};
++#define NVXE_PRESENT_INFO_READY 0x100u     // the present gate is open (adapter FB known and ready)
++#define NVXE_PRESENT_INFO_BUSY  0x200u     // the K9b deferred flip worker is queued or in flight
++struct XeGfxCursorImage {                  // B: 56 bytes, version 2 (skeleton: validated, never programmed)
++    unsigned int version;
++    unsigned int size;
++    unsigned int width, height, format, flags;
++    unsigned long long phys;
++    unsigned int ggtt;
++    unsigned int pitch;
++    unsigned int hotspotX, hotspotY;
++    unsigned int reserved;
++};
++static int gXePresent = 1;                 // debug.xegfxaccel_present: master switch for the B direction
++static bool nvXePublishPresentAPI(IOService *fb, const char *why, IOService *accel);
++static IOReturn nvXeKmsScanoutInfo(IOService *fb, struct NVRMVramRequest *r);
++#endif
+ 
+ extern "C" kern_return_t _start(kmod_info_t *ki, void *d); extern "C" kern_return_t _stop(kmod_info_t *ki, void *d);
+ #if defined(NMX_ACCEL) && defined(NMX_XEGFX)
+@@ -223,6 +325,62 @@
+     }
+ };
+ OSDefineMetaClassAndStructors(IOAccelXeGfxDRMClient, IOUserClient)
++
++// The XeGfx display stack has two IOFramebuffer classes: today's placeholder XeGfxIntelFramebuffer (XeGfxIntelFB.kext)
++// and the KMS adapter XeGfxFramebuffer (XeGfxDisplay.kext, the end state).  The adapter is a direct IOFramebuffer
++// subclass, so neither an IONDRVFramebuffer match nor a class-name match on the old name ever sees it.  Both are ours;
++// nothing else may become a head (an IOFramebuffer whose start never ran page-faults in getAttributeExt).
++static bool xgIsXeGfxFB(IOService *s)
++{
++    return s && (s->metaCast("XeGfxIntelFramebuffer") || s->metaCast("XeGfxFramebuffer"));
++}
++// The class name for logs, so a log line says which display stack is up.
++static const char *xgXeGfxFBClass(IOService *s)
++{
++    if (!s) return "?";
++    if (s->metaCast("XeGfxIntelFramebuffer")) return "XeGfxIntelFramebuffer";
++    if (s->metaCast("XeGfxFramebuffer")) return "XeGfxFramebuffer";
++    return "not a XeGfx framebuffer";
++}
++// A head may only be handed to a framebuffer whose start() has returned (see fbReadyForRegistration for the panic).
++// XeGfxIntelFB publishes XeGfxL0Ready after IONDRVFramebuffer::start() returned; the KMS adapter publishes
++// XeGfxFbRegistered and XeGfxL0Ready after IOFramebuffer::start() returned.  Either property means "started";
++// XeGfxL0Ready wins when both are present.  Returns the property that approved the head (nullptr = not ready), so
++// callers and logs can name the gate.
++static bool nvXePropTrue(IOService *s, const char *key);
++static const char *xgXeGfxFBGate(IOService *s)
++{
++    if (!s) return nullptr;
++    // The adapter can be visible while its scanout allocator is still running.
++    // Its delayed L0 gate is published only after startS3 preparation completes;
++    // FbRegistered alone must not admit an unfinished or inert adapter.
++    if (s->metaCast("XeGfxFramebuffer"))
++        return nvXePropTrue(s, "XeGfxL0Ready") ? "XeGfxL0Ready" : nullptr;
++    if (nvXePropTrue(s, "XeGfxL0Ready")) return "XeGfxL0Ready";
++    if (nvXePropTrue(s, "XeGfxFbRegistered")) return "XeGfxFbRegistered";
++    return nullptr;
++}
++// M3d: is this the KMS adapter class (as opposed to the old IONDRVFramebuffer placeholder)?  Everything the
++// adapter path adds is behind this test, so the placeholder path runs exactly the code it always ran.
++static bool nvXeIsKmsFB(IOService *s) { return s && s->metaCast("XeGfxFramebuffer"); }
++// Presence counts even when the value is not an OSBoolean: core re-publishes some gate properties as a bare key
++// (XeGfxArm is set to gIOServiceKey, not to a boolean), and a false property -- not a missing one -- is what a
++// gate must close on.  Only a missing property means "not published yet".
++static bool nvXePropTrue(IOService *s, const char *key)
++{
++    if (!s) return false;
++    OSObject *o = s->getProperty(key);
++    if (!o) return false;
++    OSBoolean *b = OSDynamicCast(OSBoolean, o);
++    return b ? b->isTrue() : true;
++}
++// L0Ready permits pipe registration; only FbReady permits adapter plane writes.
++// The first-present path explicitly publishes FbReady after its checks. Neither
++// an allocated scanout nor a start/controller-ready marker grants that permission.
++static bool nvXeFBReady(IOService *fb)
++{
++    return nvXeIsKmsFB(fb) && nvXePropTrue(fb, "XeGfxFbReady");
++}
+ #endif
+ 
+ class NVAccel : public IOGraphicsAccelerator2 {
+@@ -301,9 +459,16 @@
+     IONotifier *fIntelNote = nullptr;
+     IONotifier *fBootNote = nullptr;   // NMX_XEGFX: Apple's boot framebuffer on the iGPU
+     IONotifier *fXeNote = nullptr;     // NMX_XEGFX: XeGfxIntelFB's IONDRVFramebuffer subclass (Intel class name)
++    IONotifier *fKmsNote = nullptr;    // NMX_XEGFX: XeGfxDisplay's direct IOFramebuffer subclass XeGfxFramebuffer
+     static NVAccel *gAccel;
+     IOService *fFB = nullptr;
+     IOService *volatile fFBs[kNvMaxFB] = {};
++#ifdef NMX_XEGFX
++    // The KMS adapter's framebuffer and the placeholder both want head 4.  The adapter is parked here, never in
++    // fFBs[]/fFB: registerPendingLocked hands head 4 to it only when it has published a start gate and the
++    // placeholder has not, so an inert adapter cannot shadow the live placeholder.
++    IOService *volatile fKmsFB = nullptr;
++#endif
+     unsigned fFBRegistered = 0;
+     IOLock *fRegLock = nullptr;
+     OSObject *fMetalPlugin = nullptr;
+@@ -318,9 +483,50 @@
+         // the Intel panel is head 4 here, the slot the NVIDIA build gives another GPU's panel (the copy path); a boot
+         // framebuffer on any other device is not ours
+         if (me->fPCI && newService->getProvider() != me->fPCI) {
+-            ALOG("%s is on another device -- not ours", newService->getName());
++            // The KMS adapter XeGfxFramebuffer is published under a nub (XeGfxDisplayNub), not directly on the PCI
++            // device, so for that class look up the provider chain instead.  XeGfxIntelFramebuffer keeps the exact
++            // one-hop check it has always had.
++            bool ours = false;
++            if (newService->metaCast("XeGfxFramebuffer")) {
++                IOService *p = newService->getProvider();
++                for (int hop = 0; p && hop < 8; hop++, p = p->getProvider())
++                    if (p == me->fPCI) { ours = true; break; }
++            }
++            if (!ours) {
++                ALOG("%s is on another device -- not ours", newService->getName());
++                return true;
++            }
++        }
++        // only the XeGfx display stack's own IOFramebuffer may become the head: the generic IONDRVFramebuffer
++        // notifier also matches Apple's EFI framebuffer nubs, and registering one whose start never ran is what
++        // crashed IOFramebuffer::getAttributeExt (getAttributeExt on a reserved that is still null).  The class check
++        // plus the XeGfxL0Ready/XeGfxFbRegistered gate keep that pipe off this machine.
++        if (!xgIsXeGfxFB(newService)) {
++            ALOG("%s is not an XeGfxIntelFramebuffer -- not ours (registering it would be unsafe)", newService->getName());
+             return true;
+         }
++        ALOG("%s: %s accepted as head 4", newService->getName(), xgXeGfxFBClass(newService));
++        if (newService->metaCast("XeGfxFramebuffer")) {
++            // The KMS adapter never takes fFBs[4]/fFB on arrival: the two display stacks coexist during the M3d
++            // transition, and whichever service the kernel enumerates first would otherwise own head 4.  Park it and
++            // let registerPendingLocked choose by start gate (the placeholder wins when both are open), so an inert
++            // adapter cannot stop the live placeholder from being registered.
++            newService->retain();
++            if (OSCompareAndSwapPtr(nullptr, newService, (void *volatile *)&me->fKmsFB)) {
++                OSBitOrAtomic(1u << 4, &gNvHeadsPublished);
++                ALOG("%s: %s parked as the alternative head 4 (the placeholder keeps the head while its gate is open)",
++                     newService->getName(), xgXeGfxFBClass(newService));
++                // M3d: make this accelerator findable by the adapter (it property-matches XeGfxAccelPresent on the
++                // IOService plane and on NVAccel).  Published before head-4 registration on purpose: the adapter's
++                // first xgFlipPresent must be able to reach us as soon as its own XeGfxFbReady is up.
++                nvXePublishPresentAPI(newService, "adapter parked", me);
++            } else {
++                newService->release();
++                ALOG("%s: %s DUPLICATE -- the first KMS framebuffer keeps the alternative slot",
++                     newService->getName(), xgXeGfxFBClass(newService));
++            }
++            return true;
++        }
+         idx = 4;
+ #endif
+         const char *what = "kept";
+@@ -409,6 +615,48 @@
+         }
+         if (me->fRegLock) IOLockUnlock(me->fRegLock);
+     }
++    // A framebuffer may only be given a display pipe after its start() has returned: the family asks the
++    // framebuffer object for its attributes (IOFramebuffer::getAttributeExt) while delivering the mode change,
++    // and a framebuffer whose start never ran has a null "reserved" pointer -> page fault in the kernel
++    // (three panics on 2026-10-27: nvaccelfb_sysctl -> registerFramebufferLocked -> deliverModeChange ->
++    // display_mode_did_change -> displayModeDidChange -> IOFramebuffer::getAttributeExt, CR2=0x120).
++    static bool fbReadyForRegistration(IOService *fb, const char **why) {
++        if (!fb) { *why = "null"; return false; }
++#ifdef NMX_XEGFX
++        // Two display stacks publish their framebuffers here: the placeholder XeGfxIntelFB (XeGfxIntelFramebuffer,
++        // which publishes XeGfxL0Ready after IONDRVFramebuffer::start() returned) and the KMS adapter
++        // XeGfxFramebuffer (a direct IOFramebuffer subclass, which publishes XeGfxFbRegistered and XeGfxL0Ready
++        // after IOFramebuffer::start() returned).  Either property means "started"; XeGfxL0Ready wins when both are
++        // present.  Neither implies the object is safe to ask earlier: the family asks it for attributes while
++        // delivering a mode change, and doing so before start() returned is what panicked on 2026-10-27.
++        if (!xgIsXeGfxFB(fb)) { *why = "not an XeGfxIntelFramebuffer"; return false; }
++        if (!xgXeGfxFBGate(fb)) {
++            *why = "neither XeGfxL0Ready nor XeGfxFbRegistered has been published by the FB start";
++            return false;
++        }
++#endif
++        *why = "ready";
++        return true;
++    }
++    bool deliverModeChangeIfPipesReady(const char *whyTag) {
++        if (!fDM) return false;
++        uint8_t *dm = (uint8_t *)fDM;
++        const uint32_t n = *(const volatile uint32_t *)(dm + 0x108);
++        if (n > 8) { ALOG("deliverModeChange(%s): implausible pipe count %u -- NOT delivering", whyTag, n); return false; }
++        for (uint32_t i = 0; i < n; i++) {
++            uint8_t *p = *(uint8_t **)(dm + 0x88 + 8 * i);
++            if (!p) continue;
++            IOService *pfb = *(IOService *const volatile *)(p + 0x98);
++            const char *ready = nullptr;
++            if (!fbReadyForRegistration(pfb, &ready)) {
++                ALOG("deliverModeChange(%s): pipe %u drives %p (%s) -- NOT delivering the mode change",
++                     whyTag, i, pfb, ready);
++                return false;
++            }
++        }
++        deliverModeChange();
++        return true;
++    }
+     void deliverModeChange() {
+         if (!fDM) return;
+         uint8_t *dm = (uint8_t *)fDM;
+@@ -437,6 +685,21 @@
+         unsigned added = 0;
+         for (unsigned i = 0; i < kNvMaxFB; i++) {
+             IOService *fb = fFBs[i];
++#ifdef NMX_XEGFX
++            // Head 4 has two candidates: the placeholder (fFBs[4]) and the KMS adapter (fKmsFB).  Use the adapter only
++            // when its start gate is open and the placeholder's is not; otherwise the placeholder path is exactly the
++            // one that ran before M3d.  Selection happens here, at registration time, because the gate properties are
++            // published after start() returned -- later than the first-publish notification that filled the slots.
++            if (i == 4 && fKmsFB && fKmsFB != fb) {
++                const char *kmsGate = xgXeGfxFBGate(fKmsFB);
++                const char *curGate = fb ? xgXeGfxFBGate(fb) : nullptr;
++                if (kmsGate && !curGate) {
++                    ALOG("  %s: head 4 -> %s (gate %s open; placeholder %s)", why, xgXeGfxFBClass(fKmsFB), kmsGate,
++                         fb ? "not ready" : "absent");
++                    fb = fKmsFB;
++                }
++            }
++#endif
+             if (!fb) {
+                 // The Intel panel (index 4, NMIntelFB) does not wait for NVIDIA heads that never publish: a machine with one
+                 // monitor publishes only head 0, and the walk stopped there, so the Intel head got no pipe (measured 10-10,
+@@ -449,41 +712,91 @@
+             }
+             if (fFBRegistered & (1u << i)) continue;
+             if (i == 4 && !gNvIgpu) break;   // the Intel panel waits for debug.xegfxaccel_igpu=1
+-            unsigned b = fDM->getFramebufferCount();
+-            ALOG("  %s: calling found_framebuffer(%s index %u) -- count before %u", why, fb->getName(), i, b);
+-            fDM->found_framebuffer((IOFramebuffer *)fb);
+-            unsigned c = fDM->getFramebufferCount();
+-            fFBRegistered |= 1u << i;
+-            gNvHeadsRegistered = fFBRegistered;
+-            if (c != b + 1) {
+-                ALOG("  %s: index %u -- count went %u -> %u; the family did not add it (already known, or the cap "
+-                     "accel+0xcb0 = %u refused it). Stopping here so no later head takes this one's pipe number.",
+-                     why, i, b, c, *(const volatile uint32_t *)((const uint8_t *)this + 0xcb0));
++            const char *ready = nullptr;
++            if (!fbReadyForRegistration(fb, &ready)) {
++                ALOG("  %s: index %u (%s) is not registrable yet (%s) -- stopping this walk", why, i,
++                     fb->getName() ? fb->getName() : "?", ready);
+                 break;
+             }
++            unsigned b = fDM->getFramebufferCount();
+             uint8_t *dm = (uint8_t *)fDM;
+-            void *pipe = (b < 16) ? *(void *const volatile *)(dm + 0x88 + 8 * b) : nullptr;
+-            if (!pipe) {
+-                *(volatile uint32_t *)(dm + 0x108) = b;
+-                ALOG("  %s: index %u -- the family stored a NULL pipe in slot %u (0xe3b5, unchecked) and counted it; "
+-                     "count put back %u -> %u so no broadcast dereferences it (0xe320). This head gets no pipe this boot.",
+-                     why, i, b, c, fDM->getFramebufferCount());
++            // The family also discovers framebuffers itself. Its notification
++            // can win the race with this walk; identify the existing pipe by
++            // its actual framebuffer, never by a count increment or head ID.
++            auto findPipe = [&](unsigned count, void **out, unsigned *slot) {
++                if (count > 8) return false;
++                unsigned matches = 0;
++                for (unsigned j = 0; j < count; ++j) {
++                    void *p = *(void *const volatile *)(dm + 0x88 + 8 * j);
++                    if (!p) return false;
++                    if (*(IOService *const volatile *)((const uint8_t *)p + 0x98) == fb) {
++                        *out = p; *slot = j; ++matches;
++                    }
++                }
++                return matches == 1;
++            };
++            if (b > 8) {
++                ALOG("  %s: implausible pipe count %u -- refusing registration", why, b);
+                 break;
+             }
+-            IOService *pfb = *(IOService *const volatile *)((const uint8_t *)pipe + 0x98);
+-            if (pfb != fb) {
+-                ALOG("  %s: index %u -- pipe %u (%p) drives %p, not %s %p; keeping the pipe (it is real), stopping "
+-                     "the walk so no later head's pipe number is off by this one", why, i, b, pipe, pfb, fb->getName(), fb);
++#ifdef NMX_XEGFX
++            // KMS owns real framebuffer resources. The family's initial pipe
++            // setup can request their CPU mappings before found_framebuffer
++            // returns, so both gates must precede it and Metal publication.
++            // The CPU-only placeholder continues to use its existing path.
++            if (nvXeIsKmsFB(fb)) {
++                gNvScanout = 1;
++                gNvAperture = 1;
++                setProperty("XeGfxAccelKmsMemoryEnabled", kOSBooleanTrue);
++                ALOG("  %s: KMS scanout and resource aperture enabled before pipe registration", why);
++            }
++            ALOG("  %s: %s at index %u passed the start gate %s -- registering it", why,
++                 xgXeGfxFBClass(fb), i, xgXeGfxFBGate(fb));
++#endif
++            void *pipe = nullptr;
++            unsigned pipeSlot = 0;
++            bool adopted = findPipe(b, &pipe, &pipeSlot);
++            if (!adopted) {
++                ALOG("  %s: calling found_framebuffer(%s index %u) -- count before %u", why, fb->getName(), i, b);
++                fDM->found_framebuffer((IOFramebuffer *)fb);
++            }
++            unsigned c = fDM->getFramebufferCount();
++            // Re-scan as well: the family may have added the matching pipe
++            // between our first scan and found_framebuffer (which deduplicates).
++            if (!findPipe(c, &pipe, &pipeSlot)) {
++                if (c == b + 1 && b < 8 &&
++                    !*(void *const volatile *)(dm + 0x88 + 8 * b)) {
++                    *(volatile uint32_t *)(dm + 0x108) = b;
++                    ALOG("  %s: NULL pipe in new slot %u -- restored count to %u", why, b, b);
++                }
++                ALOG("  %s: index %u has no unique matching pipe (count %u -> %u); not registered", why, i, b, c);
+                 break;
+             }
+-            ALOG("  %s: index %u -> pipe %u (%p), count %u", why, i, b, pipe, c);
++#ifdef NMX_XEGFX
++            if (fb == fKmsFB && !fFB && OSCompareAndSwapPtr(nullptr, fb, (void *volatile *)&fFB))
++                ALOG("  %s: head 4 -> %s is now the primary framebuffer", why, xgXeGfxFBClass(fb));
++#endif
++            ALOG("  %s: index %u -> pipe %u (%p), count %u (%s)", why, i, pipeSlot, pipe, c,
++                 adopted ? "adopted existing family pipe" : "matched after registration");
++            fFBRegistered |= 1u << i;
++            gNvHeadsRegistered = fFBRegistered;
+             gNvHeadsPiped |= 1u << i;
++#ifdef NMX_XEGFX
++            // M3d: the head-4 pipe is the display pipe now.  This is the first moment the adapter is genuinely driving
++            // the panel through us, so (re)publish the present API: from here the adapter may call xgFlipPresent.
++            if (fb == fKmsFB) nvXePublishPresentAPI(fb, "head 4 piped", this);
++#endif
+             added++;
+         }
+         return added;
+     }
+-    void onCountGrewLocked() {
+-        deliverModeChange();
++    void publishArmLocked() {
++#ifdef NMX_XEGFX
++        if (nvXeIsKmsFB(fFB) && (!gNvScanout || !gNvAperture)) {
++            ALOG("KMS memory gates incomplete -- Metal arm remains closed");
++            return;
++        }
++#endif
+         gNvAccelArmed = 1;
+         if (fMetalPlugin && !getProperty("MetalPluginName")) {
+             setProperty("MetalPluginName", fMetalPlugin);
+@@ -497,6 +810,10 @@
+         ALOG("  debug.xegfxaccelfb now reads 1 -- armed-only Metal clients may have a device THIS BOOT ONLY "
+              "(heads published 0x%x, registered 0x%x, piped 0x%x)", gNvHeadsPublished, gNvHeadsRegistered, gNvHeadsPiped);
+     }
++    void onCountGrewLocked() {
++        if (deliverModeChangeIfPipesReady("count grew")) publishArmLocked();
++        else ALOG("mode change rejected -- Metal arm remains closed");
++    }
+     void registerFramebuffer(int how) {
+         if (fRegLock) IOLockLock(fRegLock);
+         registerFramebufferLocked(how);
+@@ -504,20 +821,48 @@
+     }
+     bool registerFramebufferLocked(int how) {
+         if (!fDM) { ALOG("registerFramebuffer(%d): no display machine", how); return false; }
+-        if (!fFB) { ALOG("registerFramebuffer(%d): no framebuffer has published yet", how); return false; }
++        IOService *candidate = fFB;
++#ifdef NMX_XEGFX
++        // The claim adapter is parked until registerPendingLocked selects it.
++        // With no IntelFB placeholder, fFB is intentionally null until that
++        // registration. Test the same candidate here instead of returning
++        // before the selection can run. Closed start gates still defer.
++        if (fKmsFB && xgXeGfxFBGate(fKmsFB) && !xgXeGfxFBGate(candidate))
++            candidate = fKmsFB;
++#endif
++        if (!candidate) { ALOG("registerFramebuffer(%d): no framebuffer has published yet", how); return false; }
++        const char *ready = nullptr;
++        if (!fbReadyForRegistration(candidate, &ready)) {
++            ALOG("registerFramebuffer(%d): %s is not registrable yet (%s) -- deferring, no display pipe",
++                 how, candidate->getName(), ready);
++            return false;
++        }
+         unsigned before = fDM->getFramebufferCount();
++        unsigned reconciled = 0;
+         ALOG("registerFramebuffer(%d): framebuffer count before = %u", how, before);
+         if (how == 2) {
+             if (before != 0) ALOG("  already %u -- refusing to re-run the family's sweep", before);
+             else { ALOG("  re-running IOAccelDisplayMachine::start(pci) -- the family's own sweep"); fDM->start(fPCI); }
+         } else {
+-            registerPendingLocked("sysctl");
++            reconciled = registerPendingLocked("sysctl");
+         }
+         unsigned after = fDM->getFramebufferCount();
+         ALOG("  framebuffer count after = %u", after);
+-        if (after > before) { onCountGrewLocked(); return true; }
++        if (reconciled || (how == 2 && after > before)) { onCountGrewLocked(); return true; }
+         return false;
+     }
++#ifdef NMX_XEGFX
++    // --- M4a: boot-armed auto-configuration, defined out of line below (it needs the iop/flip globals) -----------
++    // The same five actions userspace drives by hand, run by a kernel thread inside this kext so they happen before
++    // loginwindow/WindowServer asks for a Metal device.  The manual debug.xegfxaccelfb path is untouched.
++    int fBootArmed = 0;                       // 0 idle, 1 a sequence is running, 2 it finished (see gBootArmState)
++    bool bootArmRequested(const char **why, int *source);
++    void bootArmStart(const char *why, int source);
++    bool bootHeadReady(const char **cls, const char **gate);
++    void bootArmRun(void);
++    void bootArmFinish(int ok, const char *msg);
++    static void bootArmThread(void *p0, int resume);
++#endif
+     const OSSymbol *fSymAlloc = nullptr, *fSymFree = nullptr;
+     IOReturn askFramebufferForVram(struct NVRMVramRequest *r, bool alloc) {
+ #ifdef NMX_XEGFX
+@@ -547,6 +892,13 @@
+     IOReturn askFramebufferForScanout(struct NVRMVramRequest *r, IOService *fb = nullptr) {
+         if (!fb) fb = fFB;
+         if (!fb) return kIOReturnNotAttached;
++#ifdef NMX_XEGFX
++        // M3d: the KMS adapter answers with its own 80-byte v2 descriptor, not with the old 5x u32 VRAM answer, and a
++        // NotReady from it means "no scanout yet" -- deliberately NOT described from the boot aperture: that fallback
++        // exists for the placeholder path only, whose behaviour must stay byte-identical.  An adapter that has not
++        // allocated its scanout leaves the pipe without a resource instead of pointing it at stale boot memory.
++        if (nvXeIsKmsFB(fb)) return nvXeKmsScanoutInfo(fb, r);
++#endif
+         if (!fSymScanout) fSymScanout = OSSymbol::withCStringNoCopy(NVRM_VRAM_FN_SCANOUT);
+         IOReturn ret = fb->callPlatformFunction(fSymScanout, false, r, nullptr, nullptr, nullptr);
+ #ifdef NMX_XEGFX
+@@ -606,6 +958,14 @@
+         if (!fb) return nullptr;
+         for (unsigned i = 0; i < kNvMaxFB; i++)
+             if (fFBs[i] == fb) { if (idx) *idx = i; return fb; }
++#ifdef NMX_XEGFX
++        // The claim adapter stays in the alternative slot. Pipe init can ask
++        // for scanout before found_framebuffer returns and sets fFB primary.
++        if (fb == fKmsFB && xgXeGfxFBGate(fb)) {
++            if (idx) *idx = 4;
++            return fb;
++        }
++#endif
+         return nullptr;
+     }
+     IOService *fNVRM = nullptr;
+@@ -681,7 +1041,8 @@
+                      "change -- not delivering it twice", how);
+             else {
+                 ALOG("sysctl debug.xegfxaccelfb=%d: scanout-backed display pipe ENABLED, re-delivering the mode change", how);
+-                gAccel->deliverModeChange();
++                if (gAccel->deliverModeChangeIfPipesReady("sysctl"))
++                    gAccel->publishArmLocked();
+             }
+             if (gAccel->fRegLock) IOLockUnlock(gAccel->fRegLock);
+             return;
+@@ -796,7 +1157,7 @@
+             // composites here once debug.xegfxaccelfb=1 registered it; frames reach the panel through the CPU copy path
+             nvaccelInstallSysctl();
+             gNvHeadless = 0;
+-            ALOG("Intel accelerator over XeGfx: watching for NMIntelFB (head 4); register with sysctl debug.xegfxaccelfb=1");
++            ALOG("Intel accelerator over XeGfx: watching for NMIntelFB / XeGfxFramebuffer (head 4); register with sysctl debug.xegfxaccelfb=1");
+             if (OSDictionary *im = serviceMatching("NMIntelFB")) {
+                 fIntelNote = addMatchingNotification(gIOFirstPublishNotification, im, &NVAccel::fbPublished, this, nullptr, 0);
+                 im->release();
+@@ -811,6 +1172,18 @@
+                 fXeNote = addMatchingNotification(gIOFirstPublishNotification, xm, &NVAccel::fbPublished, this, nullptr, 0);
+                 xm->release();
+             }
++            // the KMS adapter XeGfxFramebuffer is a direct IOFramebuffer subclass, so neither of the two notifiers above
++            // ever sees it: give it its own (fbPublished rejects the wrong device and the wrong class)
++            if (OSDictionary *km = serviceMatching("XeGfxFramebuffer")) {
++                fKmsNote = addMatchingNotification(gIOFirstPublishNotification, km, &NVAccel::fbPublished, this, nullptr, 0);
++                km->release();
++            }
++            // M4a: arm the accelerated desktop from the kernel when THIS boot asked for it (boot argument or the
++            // XeGfxBootArm property).  Without a trigger nothing changes: the manual sysctls stay the only way.
++            {
++                const char *armWhy = nullptr; int armSource = 0;
++                if (bootArmRequested(&armWhy, &armSource)) bootArmStart(armWhy, armSource);
++            }
+             OSDictionary *fbm = nullptr;
+ #elif defined(NMX_ACCEL)
+             // AMD/Intel: the Metal device is for apps; WindowServer draws into NMXGPU's framebuffer, and the plugin copies
+@@ -852,6 +1225,27 @@
+ OSDefineMetaClassAndStructors(NVAccel, IOGraphicsAccelerator2)
+ NVAccel *NVAccel::gAccel = nullptr;
+ 
++#ifdef NMX_XEGFX
++bool NVResource::init(IOGraphicsAccelerator2 *accel, IOAccelShared2 *shared, unsigned int flags)
++{
++    const bool trace = !shared && (flags & 0x40u);
++    if (trace) ALOG("resource init BEGIN flags=0x%x shared=%p", flags, shared);
++    bool ok = IOAccelResource2::init(accel, shared, flags);
++    if (trace) ALOG("resource init END ok=%d", ok);
++    return ok;
++}
++
++bool NVDisplayPipe::init(IOGraphicsAccelerator2 *accel, IOAccelDisplayMachine *machine,
++                         IOFramebuffer *fb, unsigned int index)
++{
++    ALOG("pipe init BEGIN index=%u controller=%s", index,
++         fb && fb->getWorkLoop() ? "READY" : "MISSING");
++    bool ok = IOAccelLegacyDisplayPipe::init(accel, machine, fb, index);
++    ALOG("pipe init END index=%u ok=%d", index, ok);
++    return ok;
++}
++#endif
++
+ IOAccelMemory *NVDisplayPipe::initFramebufferResource(unsigned int index, IOAccelResource2 *res)
+ {
+ #ifdef NMX_XEGFX
+@@ -1039,8 +1433,10 @@
+ void NVVidMemory::deallocPhysical()
+ {
+     if (fScanout) {
+-        ALOG("NVVidMemory::deallocPhysical(%p): SCANOUT -- not ours to free, only forgetting it", this);
+-        fPhys = 0; fBytes = 0; fScanout = false;
++        ALOG("NVVidMemory::deallocPhysical(%p): SCANOUT -- FB owns backing; keeping import identity", this);
++        // The FB owns the backing for the entire boot. Keep the import
++        // identity across unwire/rewire; clearing fScanout would make the
++        // next allocPhysical allocate unrelated surface memory instead.
+         *(volatile unsigned long long *)((unsigned char *)this + 0xc8) = 0;
+         return;
+     }
+@@ -1141,6 +1537,7 @@
+ static unsigned int gXeFlipLive = ~0u;
+ static IOMemoryDescriptor *gXeFlipFrontMd, *gXeFlipPrevMd;
+ static IOSurface *gXeFlipFront, *gXeFlipPrev;
++static IOSurface *gXeFlipUncertain; // pinned after a latch timeout until home is confirmed
+ static SInt64 gCntXeFlip, gCntXeFlipMiss, gCntXeFlipFail;
+ #define NV_PLANE_SURF_A 0x7019cu
+ #define NV_XE_FLIP_MAX_PAGES 4224
+@@ -1172,7 +1569,7 @@
+    expected with a serialised display link) completes that transaction immediately instead of leaving it hanging. */
+ #define NV_XE_FLIP_QUEUE 4
+ struct NVXeFlipPend { void *pipe; IOSurface *s; unsigned w, h, pitch; };
+-static NVXeFlipPend gXeFlipQ[NV_XE_FLIP_QUEUE];	// [head, tail) queued, protected by gXeFlipLock, owned reference in s
++static NVXeFlipPend gXeFlipQ[NV_XE_FLIP_QUEUE];	// [head, tail) queue owns references in s and pipe
+ static unsigned int gXeFlipQHead, gXeFlipQTail;
+ static volatile SInt32 gXeFlipBusy;	// 1 while the worker is queued/running for at least one frame
+ static SInt64 gXeFlipBusySince;		// mach_absolute_time() when busy went 0 -> 1 (stuck-worker escape hatch)
+@@ -1182,6 +1579,30 @@
+ static const OSSymbol *gXeFlipQuerySym;
+ static int gXeFlipArmRun;		// consecutive deferred frames that did not reach the panel
+ 
++#ifdef NMX_XEGFX
++// --- M3d: adapter-initiated present (the XeGfxFramebuffer asks for the plane directly, see the ABI block at the top of
++// this file).  The adapter owns the mode and the scanout memory; this accelerator still owns PLANE_SURF_1_A.  One
++// present at a time (gXePresentLock), and gXePresentActive keeps the K9 defer worker from arming a compositor frame at
++// the same time: whichever side gets there first wins, the other one coalesces (defer) or returns kIOReturnBusy.
++static IOLock *gXePresentLock;
++static volatile SInt32 gXePresentActive;	// 1 while nvXePresent() is programming the plane
++static IOService *gXePresentFB;			// retained adapter framebuffer that armed the API
++static int gXePresentPublished;
++struct NVXePresentLast {
++    unsigned long long phys, flipCount;
++    unsigned int ggtt, pitch, width, height, format;
++};
++static NVXePresentLast gXePresentLast;
++static SInt64 gCntPresentOk, gCntPresentFail, gCntPresentBusy, gCntPresentNotReady, gCntPresentBadArg;
++static SInt64 gCntPresentGgttWrites, gCntPresentPhysWrites, gCntPresentLatchTimeouts;
++static SInt64 gXePresentLastUs, gXePresentMaxUs;
++static SInt64 gCntVblankReads, gCntVblankWraps;
++static SInt64 gCntKmsScanoutOk, gCntKmsScanoutNotReady;
++static SInt64 gCntCursorRequests;
++static unsigned long long gXeVblankState;	// (generation << 32) | low 32 bits of BAR0 0x70040
++static unsigned long long gXeVblankNs;		// mach time (ns) of the last observed frame-counter change
++#endif
++
+ extern "C" {
+ void _ZN18IOAccelDisplayPipe26signalTransactionInterruptEPv(void *pipe, void *arg);
+ struct thread_call *thread_call_allocate(void (*func)(void *, void *), void *param0);
+@@ -1272,9 +1693,13 @@
+ // success the frame is on the panel and takes over the front/previous references; on failure the caller still owns it.
+ static bool nvAccelXeFlipArm(IOSurface *s, unsigned w, unsigned h, unsigned pitch, bool waitIdle)
+ {
++    if (gXeFlipUncertain) return false;
+     if (!gDispMmio || !s) return (false);
+     const unsigned long long bytes = (unsigned long long)pitch * (unsigned long long)h;
+     if (bytes == 0 || bytes > 64ull * 1024 * 1024) return (false);
++    // The reserved GGTT slots are a fixed window each (xg_flip_init sized them); mapping a larger surface into one
++    // would write the PTE range of the next slot.  The adapter can reserve them first with its own size, so check.
++    if (gXeFlipSlots && bytes > gXeFlipBytes) { OSAddAtomic64(1, &gCntXeFlipFail); return (false); }
+     if (!gXeFlipSlots) {
+         unsigned int n = 0;
+         if (nvAccelResidentCall("xgFlipInit", (void *)(uintptr_t)bytes, (void *)(uintptr_t)3,
+@@ -1318,10 +1743,15 @@
+     }
+     if (waitIdle) {
+         SInt64 idleUs = 0;
+-        if (!nvAccelXeFlipWaitIdle(&idleUs)) OSAddAtomic64(1, &gCntXeDeferIdleForced);
++        if (!nvAccelXeFlipWaitIdle(&idleUs)) {
++            OSAddAtomic64(1, &gCntXeDeferIdleForced);
++            OSAddAtomic64(1, &gCntXeFlipFail);
++            return false; // Mapping alone never permits scanning unfinished GPU work.
++        }
+         gXeDeferIdleLastUs = idleUs; if (idleUs > gXeDeferIdleMaxUs) gXeDeferIdleMaxUs = idleUs;
+     }
+     const uint32_t f0 = gDispMmio[NV_DISP_FRAME_COUNTER / 4];
++    const uint32_t previousSurf = gDispMmio[NV_PLANE_SURF_A / 4];
+     gDispMmio[NV_PLANE_SURF_A / 4] = (uint32_t)gXeFlipGgtt[slot];	/* the arming write */
+     const uint64_t t0 = mach_absolute_time();
+     bool latched = false;
+@@ -1329,6 +1759,16 @@
+         if (gDispMmio[NV_DISP_FRAME_COUNTER / 4] != f0) { latched = true; break; }
+         IOSleep(1);
+     }
++    if (!latched) {
++        // The display may still be scanning the previous front. Preserve its
++        // reference chain and restore the arming register before returning.
++        gDispMmio[NV_PLANE_SURF_A / 4] = previousSurf;
++        (void)gDispMmio[NV_PLANE_SURF_A / 4];
++        gXeFlipUncertain = s; ((OSObject *)s)->retain();
++        gIopXeFlip = 0; gIopXeDefer = 0;
++        OSAddAtomic64(1, &gCntXeFlipFail);
++        return false;
++    }
+     nvAccelXeFlipDrop(&gXeFlipPrev);
+     gXeFlipPrev = gXeFlipFront;
+     gXeFlipFront = s; ((OSObject *)s)->retain();
+@@ -1341,7 +1781,28 @@
+ // K8 (synchronous): the old zero-copy flip, no idle wait - kept for A/B against the deferred path (defer=0).
+ static bool nvAccelXeFlip(IOService *fb, unsigned head, IOSurface *s, unsigned w, unsigned h, unsigned pitch)
+ {
++#ifdef NMX_XEGFX
++    // M3d: two writers of PLANE_SURF_1_A must never arm at the same time - the adapter presents into the same plane
++    // on its own thread.  The deferred worker coalesces (a present makes it drop the queued frame), this is the A/B
++    // synchronous path only.  False just routes the frame through the CPU copy path below.
++    if (__atomic_load_n(&gXePresentActive, __ATOMIC_ACQUIRE) != 0) return (false);
++#endif
+     if (!gIopXeFlip || !gDispMmio || !s || head != 4) return (false);
++#ifdef NMX_XEGFX
++    if (nvXeIsKmsFB(fb)) {
++        if (!gXePresentLock) return false;
++        IOLockLock(gXePresentLock);
++        if (gXeFlipLock) IOLockLock(gXeFlipLock);
++        const bool busy = gXeFlipQHead != gXeFlipQTail ||
++            __atomic_load_n(&gXeFlipBusy, __ATOMIC_ACQUIRE) != 0;
++        if (!busy) __atomic_store_n(&gXePresentActive, 1, __ATOMIC_RELEASE);
++        if (gXeFlipLock) IOLockUnlock(gXeFlipLock);
++        bool ok = !busy && nvAccelXeFlipArm(s, w, h, pitch, false);
++        if (!busy) __atomic_store_n(&gXePresentActive, 0, __ATOMIC_RELEASE);
++        IOLockUnlock(gXePresentLock);
++        return ok;
++    }
++#endif
+     return (nvAccelXeFlipArm(s, w, h, pitch, false));
+ }
+ // True while a deferred frame is queued or in flight: WindowServer must not recycle the frame's surface yet.
+@@ -1358,7 +1819,8 @@
+         if (age > 250000) {
+             OSAddAtomic64(1, &gCntXeDeferForced);
+             gIopXeDefer = 0;
+-            __atomic_store_n(&gXeFlipBusy, 0, __ATOMIC_RELEASE);
++            // Only the worker clears gXeFlipBusy. Its frame/pipe references
++            // and plane-write exclusion remain live until it actually exits.
+             ALOG("iop: deferred flip stuck for %lld us (queued %u armed %lld signals %lld) -- debug.xegfxaccel_iop_xe_defer=0",
+                 (long long)age, (unsigned)(gXeFlipQTail - gXeFlipQHead),
+                 (long long)gCntXeDeferArmed, (long long)gCntXeDeferSignals);
+@@ -1393,21 +1855,25 @@
+         if (gen != __atomic_load_n(&gXeFlipGen, __ATOMIC_ACQUIRE)) {	// the pipe went away while this frame was queued
+             OSAddAtomic64(1, &gCntXeDeferDropped);
+             ((OSObject *)p.s)->release();
++            ((OSObject *)p.pipe)->release();
+             continue;
+         }
+         const bool ok = nvAccelXeFlipArm(p.s, p.w, p.h, p.pitch, true);
++        ((OSObject *)p.s)->release(); // Drop queue ref on both outcomes.
+         if (ok) {
+             OSAddAtomic64(1, &gCntXeDeferArmed);
+             gXeFlipArmRun = 0;
+         } else {
+             OSAddAtomic64(1, &gCntXeDeferDropped);
+-            ((OSObject *)p.s)->release();	// the worker owns the reference until the frame is on the panel
+             if (++gXeFlipArmRun >= 6 && gIopXeDefer) {
+                 gIopXeDefer = 0;
+                 ALOG("iop: 6 deferred frames in a row did not reach the panel -- debug.xegfxaccel_iop_xe_defer=0 (synchronous flip)");
+             }
+         }
+-        if (gen != __atomic_load_n(&gXeFlipGen, __ATOMIC_ACQUIRE)) continue;	// pipe is gone: never signal a dead object
++        if (gen != __atomic_load_n(&gXeFlipGen, __ATOMIC_ACQUIRE)) {
++            ((OSObject *)p.pipe)->release();
++            continue; // Drop the queued pipe reference without signaling it.
++        }
+         bool last = false;
+         IOLockLock(gXeFlipLock);
+         last = (gXeFlipQHead == gXeFlipQTail);
+@@ -1418,6 +1884,7 @@
+         IOLockUnlock(gXeFlipLock);
+         OSAddAtomic64(1, &gCntXeDeferSignals);
+         _ZN18IOAccelDisplayPipe26signalTransactionInterruptEPv(p.pipe, nullptr);
++        ((OSObject *)p.pipe)->release();
+     }
+ }
+ // Display thread: hand the frame to the worker.  One queue entry per display transaction, so the worker signals each
+@@ -1432,8 +1899,17 @@
+     if (!gXeFlipCall) gXeFlipCall = thread_call_allocate(nvAccelXeFlipDeferRun, nullptr);
+     if (!gXeFlipLock || !gXeFlipCall) { OSAddAtomic64(1, &gCntXeDeferDropped); return; }
+     ((OSObject *)s)->retain();
++    ((OSObject *)pipe)->retain();
+     bool start = false, overflow = false;
+     IOLockLock(gXeFlipLock);
++#ifdef NMX_XEGFX
++    if (__atomic_load_n(&gXePresentActive, __ATOMIC_ACQUIRE) != 0) {
++        // M3d: the adapter is programming the plane itself right now.  Do not queue a compositor frame that would arm
++        // the same plane behind its back -- complete this transaction immediately instead (same price as an overflow:
++        // the panel may show a device-side partial frame, but WindowServer is never left waiting for a wakeup).
++        overflow = true;
++    } else
++#endif
+     if (gXeFlipQTail - gXeFlipQHead >= NV_XE_FLIP_QUEUE) {
+         overflow = true;
+     } else {
+@@ -1455,10 +1931,427 @@
+         ((OSObject *)s)->release();
+         OSAddAtomic64(1, &gCntXeDeferSignals);
+         _ZN18IOAccelDisplayPipe26signalTransactionInterruptEPv(pipe, nullptr);
++        ((OSObject *)pipe)->release();
+         return;
+     }
+     if (start) thread_call_enter(gXeFlipCall);
+ }
++#ifdef NMX_XEGFX
++// --- M3d implementation: the adapter <-> accelerator present contract (structs/ABI at the top of the file) ---------
++
++// 64-bit extension of the display frame counter (BAR0 0x70040).  The register is 32 bits (it wraps after ~2 years at
++// 60 Hz; a polled read can also miss changes), so the state word keeps (generation, last low word) in ONE 64-bit
++// atomic: a reader can never observe a torn pair.  The timestamp is the mach time (ns) of the change that produced the
++// current generation.  Lock free and safe in any context (the adapter polls this from a timer).
++static unsigned long long nvXeVblankNow(uint64_t *nsOut)
++{
++    if (nsOut) *nsOut = 0;
++    if (!gDispMmio) return 0;
++    const unsigned int raw = gDispMmio[NV_DISP_FRAME_COUNTER / 4];
++    for (int attempt = 0; attempt < 8; attempt++) {
++        const unsigned long long st = __atomic_load_n(&gXeVblankState, __ATOMIC_ACQUIRE);
++        const unsigned int last = (unsigned int)st;
++        const unsigned int gen = (unsigned int)(st >> 32);
++        if (raw == last) {
++            if (nsOut) *nsOut = __atomic_load_n(&gXeVblankNs, __ATOMIC_ACQUIRE);
++            return ((unsigned long long)gen << 32) | raw;
++        }
++        const unsigned int newGen = gen + (raw < last ? 1u : 0u);
++        const unsigned long long nst = ((unsigned long long)newGen << 32) | raw;
++        const uint64_t now = mach_absolute_time();
++        uint64_t absNs = 0;
++        absolutetime_to_nanoseconds(now, &absNs);
++        if (__sync_bool_compare_and_swap(&gXeVblankState, st, nst)) {
++            OSAddAtomic64(1, &gCntVblankReads);
++            if (raw < last) OSAddAtomic64(1, &gCntVblankWraps);
++            __atomic_store_n(&gXeVblankNs, (unsigned long long)absNs, __ATOMIC_RELEASE);
++            if (nsOut) *nsOut = absNs;
++            return nst;
++        }
++    }
++    if (nsOut) *nsOut = __atomic_load_n(&gXeVblankNs, __ATOMIC_ACQUIRE);
++    return __atomic_load_n(&gXeVblankState, __ATOMIC_ACQUIRE);
++}
++
++// "May this accelerator write PLANE_SURF_1_A for the adapter right now?"  Deliberately strict: the adapter's own
++// XeGfxFbReady is the contract point (docs/20-M3D-ACCEL.md).  A present before it is not a failure to log loudly --
++// it is simply too early: the adapter retries for ~2 s after enableController.
++static bool nvXePresentReady(IOService **fbOut, const char **why)
++{
++    if (!gXePresent) { if (why) *why = "disabled (debug.xegfxaccel_present=0)"; return false; }
++    IOService *fb = gXePresentFB;
++    if (!fb) { if (why) *why = "no XeGfxFramebuffer has published itself yet"; return false; }
++    if (!gDispMmio) { if (why) *why = "BAR0 display window is not mapped"; return false; }
++    if (!nvXeFBReady(fb)) { if (why) *why = "the adapter FB has not published XeGfxFbReady yet"; return false; }
++    if (fbOut) *fbOut = fb;
++    return true;
++}
++
++// B: xgFlipPresent.  Point PLANE_SURF_1_A at the adapter's frame: direct when the adapter knows the GGTT offset of its
++// scanout (no PTE writes at all), otherwise map the frame's physical pages into one of the reserved zero-copy GGTT slots
++// and point the plane at that slot (exactly like the compositor flip path, except the pages come from a phys address
++// instead of an IOSurface).  The frame is never copied.  Returns:
++//   kIOReturnSuccess       the plane was programmed (with flags bit DONE; LATCHED when a vblank was seen)
++//   kIOReturnNotReady      the adapter FB is not ready / API not armed: no register was touched
++//   kIOReturnBusy          the K9b deferred flip worker owns the plane: no register write, retry
++//   kIOReturnBadArgument   the frame does not fit the contract
++//   kIOReturnTimeout       written but no vblank inside 25 ms: the previous frame was put back
++//   kIOReturnNoDevice      the read-back did not match: the previous frame was put back
++static IOReturn nvXePresent(struct XeGfxPresent *p)
++{
++    if (!p) { OSAddAtomic64(1, &gCntPresentBadArg); return kIOReturnBadArgument; }
++    // The adapter header ships this struct as "version 1" (XEGFX_M3D_PRESENT_VERSION 1u) while its layout is
++    // byte-for-byte the version-2 ABI, so both spellings are accepted: 1 = the adapter's legacy spelling, 2 = the
++    // contract spelling now sent by the adapter (verified 2026-10-28 against XeGfxDisplay.h:241-259 + static_asserts;
++    // the adapter's own m3dPresent() accepts 1|2 the same way).  Size is the real layout check; version is 1 or 2.
++    if ((p->version != NVXE_ABI_VERSION && p->version != 1u) ||
++        p->size != (unsigned int)sizeof(struct XeGfxPresent)) {
++        OSAddAtomic64(1, &gCntPresentBadArg);
++        if (gCntPresentBadArg <= 8)
++            ALOG("present: ABI mismatch (v%u size %u, expected v%u|1 size %u) -- ignored", p->version, p->size,
++                 NVXE_ABI_VERSION, (unsigned int)sizeof(struct XeGfxPresent));
++        return kIOReturnBadArgument;
++    }
++    IOService *fb = nullptr;
++    const char *why = "?";
++    if (!nvXePresentReady(&fb, &why)) {
++        OSAddAtomic64(1, &gCntPresentNotReady);
++        if (gCntPresentNotReady <= 8)
++            ALOG("present: not ready (%s), flip %llu -- previous frame kept; the adapter retries", why,
++                 (unsigned long long)p->flipCount);
++        return kIOReturnNotReady;
++    }
++    const unsigned int w = p->width, h = p->height, pitch = p->pitch;
++    const unsigned long long bytes = (unsigned long long)pitch * (unsigned long long)h;
++    const bool fullRegion = (p->regionW == 0) ||
++        (p->regionX == 0 && p->regionY == 0 && p->regionW == w && p->regionH == h);
++    // head==0 is also accepted as head 4: the adapter header documents "4 (0 => 4)".
++    if ((p->head != 4 && p->head != 0) || w == 0 || h == 0 || w > 16384 || h > 16384 || pitch < 4ull * w || (pitch & 3u) ||
++        bytes == 0 || bytes > 64ull * 1024 * 1024 || !fullRegion ||
++        (p->format != 0 && p->format != NVXE_FORMAT_XRGB8888) || (!p->ggtt && !p->phys)) {
++        OSAddAtomic64(1, &gCntPresentBadArg);
++        if (gCntPresentBadArg <= 8)
++            ALOG("present: bad frame (head %u %ux%u pitch %u fmt 0x%x phys 0x%llx ggtt 0x%x region %u,%u %ux%u)"
++                 " -- ignored, previous frame kept", p->head, w, h, pitch, p->format, p->phys, p->ggtt,
++                 p->regionX, p->regionY, p->regionW, p->regionH);
++        return kIOReturnBadArgument;
++    }
++    // NO_WAIT spelling: v2 callers use bit 1; the adapter's v1 header defines NO_WAIT as bit 0 (XEGFX_M3D_PRESENT_NO_WAIT
++    // 1u) while bit 0 means WAIT_LATCH in the v2 spelling, so bit 0 is honoured as NO_WAIT only for version-1 requests.
++    const bool noWait = ((p->flags & NVXE_PRESENT_NO_WAIT) != 0) ||
++                        (p->version == 1u && (p->flags & NVXE_PRESENT_WAIT_LATCH) != 0);
++    if (!gXePresentLock) {
++        IOLock *l = IOLockAlloc();
++        if (l && !OSCompareAndSwapPtr(nullptr, l, (void *volatile *)&gXePresentLock)) IOLockFree(l);
++    }
++    if (!gXePresentLock) { OSAddAtomic64(1, &gCntPresentFail); return kIOReturnNoMemory; }
++    IOLockLock(gXePresentLock);
++    if (gXeFlipLock) IOLockLock(gXeFlipLock);
++    const bool deferBusy = (gXeFlipQHead != gXeFlipQTail) ||
++                           (__atomic_load_n(&gXeFlipBusy, __ATOMIC_ACQUIRE) != 0);
++    if (!deferBusy) __atomic_store_n(&gXePresentActive, 1, __ATOMIC_RELEASE);
++    if (gXeFlipLock) IOLockUnlock(gXeFlipLock);
++    if (deferBusy) {
++        IOLockUnlock(gXePresentLock);
++        OSAddAtomic64(1, &gCntPresentBusy);
++        if (gCntPresentBusy <= 8)
++            ALOG("present: the K9b deferred flip worker owns the plane -- kIOReturnBusy, retry");
++        return kIOReturnBusy;
++    }
++    IOReturn rc = kIOReturnSuccess;
++    const uint64_t tStart = mach_absolute_time();
++    const uint32_t prevSurf = gDispMmio[NV_PLANE_SURF_A / 4];
++    const uint32_t f0 = gDispMmio[NV_DISP_FRAME_COUNTER / 4];
++    unsigned int wroteGgtt = 0;
++    unsigned int presentSlot = ~0u;	/* the reserved slot this present mapped, if any */
++    bool latched = false;
++    static unsigned long long pages[NV_XE_FLIP_MAX_PAGES];
++    do {
++        if (p->ggtt) {
++            if (p->ggtt & 0xffu) { rc = kIOReturnBadArgument; break; }
++            wroteGgtt = p->ggtt;
++            gDispMmio[NV_PLANE_SURF_A / 4] = wroteGgtt;
++            OSAddAtomic64(1, &gCntPresentGgttWrites);
++        } else if (p->phys) {
++            if (p->phys >= 0x100000000ull || (p->phys & 0xfffull)) { rc = kIOReturnBadArgument; break; }
++            if (!gXeFlipSlots) {
++                unsigned int n = 0;
++                if (nvAccelResidentCall("xgFlipInit", (void *)(uintptr_t)bytes, (void *)(uintptr_t)3,
++                        gXeFlipGgtt, &n) != kIOReturnSuccess || n == 0) {
++                    rc = kIOReturnNotReady;
++                    break;
++                }
++                gXeFlipSlots = n; gXeFlipBytes = bytes; gXeFlipNext = 0;
++                ALOG("present: reserved %u zero-copy GGTT slots x %llu bytes for adapter frames", n, bytes);
++            } else if (bytes > gXeFlipBytes) {
++                rc = kIOReturnBadArgument;
++                break;
++            }
++            unsigned int slot = gXeFlipNext % gXeFlipSlots;
++            for (unsigned int i = 0; i < gXeFlipSlots; i++) {
++                slot = (gXeFlipNext + i) % gXeFlipSlots;
++                if (slot != gXeFlipLive) break;
++            }
++            if (slot == gXeFlipLive) { rc = kIOReturnBusy; break; }
++            const unsigned int npages = (unsigned int)((bytes + 4095ull) >> 12);
++            if (npages == 0 || npages > NV_XE_FLIP_MAX_PAGES) { rc = kIOReturnBadArgument; break; }
++            const unsigned long long base = p->phys & ~0xfffull;
++            for (unsigned int i = 0; i < npages; i++) pages[i] = base + ((unsigned long long)i << 12);
++            const IOReturn mapRc = nvAccelResidentCall("xgFlipMap", (void *)(uintptr_t)slot, pages,
++                                                       (void *)(uintptr_t)npages, (void *)(uintptr_t)bytes);
++            if (mapRc != kIOReturnSuccess) { rc = mapRc; break; }
++            wroteGgtt = (unsigned int)gXeFlipGgtt[slot];
++            gDispMmio[NV_PLANE_SURF_A / 4] = wroteGgtt;
++            presentSlot = slot;
++            OSAddAtomic64(1, &gCntPresentPhysWrites);
++        } else {
++            rc = kIOReturnBadArgument;
++            break;
++        }
++        if (gDispMmio[NV_PLANE_SURF_A / 4] != wroteGgtt) {
++            const uint32_t got = gDispMmio[NV_PLANE_SURF_A / 4];
++            if (prevSurf) gDispMmio[NV_PLANE_SURF_A / 4] = prevSurf;
++            rc = kIOReturnNoDevice;
++            ALOG("present: PLANE_SURF_1_A read back 0x%x, expected 0x%x -- previous frame put back", got, wroteGgtt);
++            break;
++        }
++        if (!noWait) {
++            while (nvIopUsBetween((uint64_t)tStart, mach_absolute_time()) < 25000) {
++                if (gDispMmio[NV_DISP_FRAME_COUNTER / 4] != f0) { latched = true; break; }
++                IOSleep(1);
++            }
++            if (!latched) {
++                if (prevSurf) gDispMmio[NV_PLANE_SURF_A / 4] = prevSurf;
++                OSAddAtomic64(1, &gCntPresentLatchTimeouts);
++                rc = kIOReturnTimeout;
++                if (gCntPresentLatchTimeouts <= 8)
++                    ALOG("present: no vblank inside 25 ms (flip %llu) -- previous frame put back",
++                         (unsigned long long)p->flipCount);
++                break;
++            }
++        }
++        // Only now does the plane really scan out this frame: the reserved slot becomes the live one, so the
++        // compositor flip path will pick a different slot.  Before this point a failure restored the previous frame.
++        if (presentSlot != ~0u) { gXeFlipLive = presentSlot; gXeFlipNext = presentSlot + 1; }
++        p->flags |= NVXE_PRESENT_DONE;
++        if (latched) p->flags |= NVXE_PRESENT_LATCHED;
++        gXePresentLast.phys = p->phys;
++        gXePresentLast.ggtt = wroteGgtt;
++        gXePresentLast.pitch = pitch;
++        gXePresentLast.width = w;
++        gXePresentLast.height = h;
++        gXePresentLast.format = p->format;
++        gXePresentLast.flipCount = p->flipCount;
++        OSAddAtomic64(1, &gCntPresentOk);
++        const SInt64 us = nvIopUsBetween((uint64_t)tStart, mach_absolute_time());
++        gXePresentLastUs = us;
++        if (us > gXePresentMaxUs) gXePresentMaxUs = us;
++        if (gCntPresentOk == 1)
++            ALOG("present: first adapter frame on head 4: %ux%u pitch %u -> ggtt 0x%x (flip %llu, %lld us, latched %d)",
++                 w, h, pitch, wroteGgtt, (unsigned long long)p->flipCount, (long long)us, latched ? 1 : 0);
++    } while (0);
++    if (gXeFlipLock) IOLockLock(gXeFlipLock);
++    __atomic_store_n(&gXePresentActive, 0, __ATOMIC_RELEASE);
++    if (gXeFlipLock) IOLockUnlock(gXeFlipLock);
++    IOLockUnlock(gXePresentLock);
++    if (rc != kIOReturnSuccess) {
++        OSAddAtomic64(1, &gCntPresentFail);
++        if (gCntPresentFail <= 8)
++            ALOG("present: failed rc 0x%x (flip %llu phys 0x%llx ggtt 0x%x) -- previous frame still on the plane",
++                 rc, (unsigned long long)p->flipCount, p->phys, p->ggtt);
++    }
++    return rc;
++}
++
++// The adapter's vblank source.  Both calls read the same pair; only the argument order differs (ABI block at the top):
++// xgVblankCount(p1 = uint64 *count, p2 = uint64 *ns), xgVblankTime(p1 = uint64 *ns, p2 = uint64 *count).
++static IOReturn nvXeVblankCount(void *p1, void *p2)
++{
++    uint64_t ns = 0;
++    const unsigned long long count = nvXeVblankNow(&ns);
++    if (p1) *(unsigned long long *)p1 = count;
++    if (p2) *(unsigned long long *)p2 = ns;
++    return kIOReturnSuccess;
++}
++static IOReturn nvXeVblankTime(void *p1, void *p2)
++{
++    uint64_t ns = 0;
++    const unsigned long long count = nvXeVblankNow(&ns);
++    if (p1) *(unsigned long long *)p1 = ns;
++    if (p2) *(unsigned long long *)p2 = count;
++    return kIOReturnSuccess;
++}
++
++// B: xgGetPresentInfo (diagnostics: last programmed frame, live PLANE_SURF_1_A, gates).
++static IOReturn nvXeGetPresentInfo(struct XeGfxPresentInfo *pi)
++{
++    if (!pi) return kIOReturnBadArgument;
++    bzero(pi, sizeof(struct XeGfxPresentInfo));
++    pi->version = NVXE_ABI_VERSION;
++    pi->size = (unsigned int)sizeof(struct XeGfxPresentInfo);
++    pi->head = 4;
++    if (gXePresentLock) IOLockLock(gXePresentLock);
++    pi->phys = gXePresentLast.phys;
++    pi->flipCount = gXePresentLast.flipCount;
++    pi->pitch = gXePresentLast.pitch;
++    pi->width = gXePresentLast.width;
++    pi->height = gXePresentLast.height;
++    pi->format = gXePresentLast.format;
++    if (gXePresentLock) IOLockUnlock(gXePresentLock);
++    uint64_t ns = 0;
++    pi->vblankCount = nvXeVblankNow(&ns);
++    pi->vblankNs = ns;
++    IOService *fb = nullptr;
++    const char *why = "?";
++    if (nvXePresentReady(&fb, &why)) pi->flags |= NVXE_PRESENT_INFO_READY;
++    if (gXeFlipQHead != gXeFlipQTail || __atomic_load_n(&gXeFlipBusy, __ATOMIC_ACQUIRE) != 0)
++        pi->flags |= NVXE_PRESENT_INFO_BUSY;
++    pi->planeSurfGgtt = gDispMmio ? gDispMmio[NV_PLANE_SURF_A / 4] : 0;
++    return kIOReturnSuccess;
++}
++
++// B: xgCursorImage skeleton (M4 fills it in).  Validate so the adapter side can integrate against the real ABI, log
++// the first few requests and touch no register: a cursor plane programmed before the adapter's mode is up is exactly
++// the kind of early register write M3d must not do.
++static IOReturn nvXeCursor(struct XeGfxCursorImage *ci)
++{
++    OSAddAtomic64(1, &gCntCursorRequests);
++    if (!ci) return kIOReturnBadArgument;
++    if (ci->version != NVXE_ABI_VERSION || ci->size != (unsigned int)sizeof(struct XeGfxCursorImage) ||
++        ci->width == 0 || ci->height == 0 || ci->width > 256 || ci->height > 256 || !(ci->ggtt || ci->phys))
++        return kIOReturnBadArgument;
++    if (gCntCursorRequests <= 8)
++        ALOG("cursor: %ux%u fmt 0x%x phys 0x%llx ggtt 0x%x hotspot %u,%u -- validated, not programmed (M4)",
++             ci->width, ci->height, ci->format, ci->phys, ci->ggtt, ci->hotspotX, ci->hotspotY);
++    return kIOReturnUnsupported;
++}
++
++// A: xgGetScanoutInfo on the adapter FB (80-byte v2).  Called from askFramebufferForScanout() for the display-pipe
++// resource: the frame becomes the pipe's vidmem under the SAME physical address, and the zero-copy flip path then arms
++// PLANE_SURF at it.  NotReady means the adapter has not allocated/presented its scanout yet; the pipe must then get no
++// resource at all (NOT the boot aperture -- that fallback belongs to the placeholder path only, docs/20).
++static IOReturn nvXeKmsScanoutInfo(IOService *fb, struct NVRMVramRequest *r)
++{
++    if (!fb || !r) return kIOReturnBadArgument;
++    struct XeGfxScanoutInfo si;
++    bzero(&si, sizeof(si));
++    si.version = NVXE_ABI_VERSION;
++    si.size = (unsigned int)sizeof(si);
++    const OSSymbol *sym = OSSymbol::withCStringNoCopy("xgGetScanoutInfo");
++    if (!sym) return kIOReturnNoMemory;
++    const IOReturn rc = fb->callPlatformFunction(sym, false, &si, nullptr, nullptr, nullptr);
++    sym->release();
++    if (rc != kIOReturnSuccess) {
++        OSAddAtomic64(1, &gCntKmsScanoutNotReady);
++        if (gCntKmsScanoutNotReady <= 8)
++            ALOG("scanout: %s not ready (rc 0x%x) -- no display-pipe resource yet", fb->getName(), rc);
++        return rc;
++    }
++    if (si.version != NVXE_ABI_VERSION || si.size != (unsigned int)sizeof(si) ||
++        !(si.flags & NVXE_SCANOUT_READY) || si.phys == 0 || si.pitch == 0 || si.width == 0 || si.height == 0 ||
++        si.pitch < 4ull * si.width) {
++        OSAddAtomic64(1, &gCntKmsScanoutNotReady);
++        if (gCntKmsScanoutNotReady <= 8)
++            ALOG("scanout: %s descriptor not ready (v%u size %u flags 0x%x phys 0x%llx %ux%u pitch %u)",
++                 fb->getName(), si.version, si.size, si.flags, si.phys, si.width, si.height, si.pitch);
++        return kIOReturnNotReady;
++    }
++    bzero(r, sizeof(*r));
++    r->version = NVRM_VRAM_ABI_VERSION;
++    r->phys = si.phys;
++    r->kva = (void *)si.kva;
++    r->width = si.width;
++    r->height = si.height;
++    r->pitch = si.pitch;
++    r->size = (unsigned long long)si.pitch * si.height;
++    r->actualSize = r->size;
++    OSAddAtomic64(1, &gCntKmsScanoutOk);
++    if (gCntKmsScanoutOk == 1)
++        ALOG("scanout: display-pipe resource over the adapter scanout: %ux%u pitch %u at 0x%llx (%s)",
++             si.width, si.height, si.pitch, si.phys, (si.flags & NVXE_SCANOUT_GGTT) ? "ggtt" : "phys");
++    return kIOReturnSuccess;
++}
++
++// A completed CPU copy must become the displayed buffer again if an earlier
++// zero-copy frame moved the plane away. Reuse the adapter present lock/latch
++// and rollback path; a busy worker leaves the previous frame on screen.
++static IOReturn nvXeRestoreCopyTarget(IOService *fb)
++{
++    if (!nvXeIsKmsFB(fb)) return kIOReturnSuccess;
++    XeGfxScanoutInfo si = {};
++    si.version = NVXE_ABI_VERSION; si.size = sizeof(si);
++    const OSSymbol *sym = OSSymbol::withCStringNoCopy("xgGetScanoutInfo");
++    if (!sym) return kIOReturnNoMemory;
++    const IOReturn rc = fb->callPlatformFunction(sym, false, &si, nullptr, nullptr, nullptr);
++    sym->release();
++    if (rc != kIOReturnSuccess) return rc;
++    if (si.version != NVXE_ABI_VERSION || si.size != sizeof(si) ||
++        !(si.flags & NVXE_SCANOUT_READY) || !si.phys || !si.kva || !si.ggtt ||
++        !si.width || !si.height || si.pitch < 4ull * si.width) return kIOReturnNotReady;
++    if (!gXeFlipUncertain && gDispMmio && gDispMmio[NV_PLANE_SURF_A / 4] == si.ggtt) return kIOReturnSuccess;
++    XeGfxPresent frame = {};
++    frame.version = NVXE_ABI_VERSION; frame.size = sizeof(frame);
++    frame.phys = si.phys; frame.kva = si.kva; frame.ggtt = si.ggtt;
++    frame.width = si.width; frame.height = si.height; frame.pitch = si.pitch;
++    frame.regionW = si.width; frame.regionH = si.height;
++    frame.format = si.format; frame.head = 4;
++    // Zero flags select the bounded latch wait; NO_WAIT is deliberately clear.
++    const IOReturn presentRc = nvXePresent(&frame);
++    if (presentRc == kIOReturnSuccess) {
++        OSAddAtomic64(1, &gCntIopFlipHome);
++        // The adapter buffer is now latched: retired compositor pages can
++        // safely leave the display's front/previous/uncertain reference set.
++        nvAccelXeFlipDrop(&gXeFlipUncertain);
++        nvAccelXeFlipDrop(&gXeFlipPrev);
++        nvAccelXeFlipDrop(&gXeFlipFront);
++        gXeFlipLive = ~0u;
++    }
++    return presentRc;
++}
++
++// B discovery: the adapter property-matches XeGfxAccelPresent on the IOService plane (and the nub).  Published as soon
++// as the adapter FB is parked or its head-4 pipe binds -- before XeGfxFbReady on purpose, so the adapter's very first
++// xgFlipPresent can reach us; the register-write gate itself is XeGfxFbReady inside nvXePresent().
++static bool nvXePublishPresentAPI(IOService *fb, const char *why, IOService *accel)
++{
++    if (!fb) return false;
++    if (gXePresentFB != fb) {
++        if (gXePresentFB) ((OSObject *)gXePresentFB)->release();
++        gXePresentFB = fb;
++        ((OSObject *)fb)->retain();
++        gXePresentPublished = 0;
++    }
++    OSNumber *head = OSNumber::withNumber((unsigned long long)4, 32);
++    IOService *targets[2];
++    targets[0] = accel;
++    targets[1] = fb->getProvider();
++    for (int i = 0; i < 2; i++) {
++        IOService *s = targets[i];
++        if (!s) continue;
++        s->setProperty("XeGfxAccelPresent", kOSBooleanTrue);
++        if (head) s->setProperty("XeGfxAccelPresentHead", head);
++    }
++    if (head) head->release();
++    if (!gXePresentPublished) {
++        gXePresentPublished = 1;
++        ALOG("present: API armed on %s (%s) -- the adapter may now call xgFlipPresent", fb->getName(), why);
++    }
++    return true;
++}
++
++// PerformTransaction gate: the placeholder path keeps exactly the code it always ran; the adapter FB may only have the
++// plane armed for it when it is the framebuffer that published the API and its ready property is up.  A compositor
++// frame must never be armed onto a plane the adapter has not claimed.
++static bool nvXePlaneWriteAllowed(IOService *fb)
++{
++    if (!nvXeIsKmsFB(fb)) return true;
++    if (!gXePresentFB || fb != gXePresentFB) return false;
++    return nvXeFBReady(fb);
++}
++#else	/* !NMX_XEGFX */
++// M3d exists only in the XeGfx build: the other products keep the display-pipe gate exactly as it was.
++static bool nvXePlaneWriteAllowed(IOService *fb) { (void)fb; return (true); }
++#endif
+ #define NVIOP_LOG_MAX 40
+ static unsigned gIopLogs = 0;
+ #define NVIOPLOG(fmt, ...) do { if (gIopLogs < NVIOP_LOG_MAX) { gIopLogs++; ALOG("iop: " fmt, ##__VA_ARGS__); } } while (0)
+@@ -1477,28 +2370,32 @@
+ void NVDisplayPipe::free()
+ {
+     iopDropSources();
+-    // K9: the deferred flip worker must be done with the pipe before it goes away; its queued frame would otherwise
+-    // be armed for a display pipe that is being freed.
++    NVXeFlipPend retired[NV_XE_FLIP_QUEUE] = {};
++    unsigned retiredCount = 0;
+     if (gXeFlipLock) {
+         IOLockLock(gXeFlipLock);
+         __atomic_add_fetch(&gXeFlipGen, 1, __ATOMIC_ACQ_REL);
+-        while (gXeFlipQHead != gXeFlipQTail) {
++        while (gXeFlipQHead != gXeFlipQTail && retiredCount < NV_XE_FLIP_QUEUE) {
+             NVXeFlipPend *q = &gXeFlipQ[gXeFlipQHead % NV_XE_FLIP_QUEUE];
+-            if (q->s) { ((OSObject *)q->s)->release(); q->s = nullptr; q->pipe = nullptr; }
++            retired[retiredCount++] = *q;
++            q->s = nullptr; q->pipe = nullptr;
+             gXeFlipQHead++;
+         }
+         gXeFlipQHead = gXeFlipQTail = 0;
+         IOLockUnlock(gXeFlipLock);
+-        uint64_t end = 0; clock_interval_to_deadline(100, kMillisecondScale, &end);
+-        while (__atomic_load_n(&gXeFlipBusy, __ATOMIC_ACQUIRE) != 0 && mach_absolute_time() < end) IOSleep(1);
+-        if (__atomic_load_n(&gXeFlipBusy, __ATOMIC_ACQUIRE) != 0)
+-            ALOG("iop: deferred flip worker still busy when the display pipe went away -- dropping the busy state");
+-        IOLockLock(gXeFlipLock);
+-        __atomic_store_n(&gXeFlipBusy, 0, __ATOMIC_RELEASE);
+-        IOLockUnlock(gXeFlipLock);
++        // Releasing another pipe can enter its free(); never do it under
++        // the shared queue lock. An in-flight worker owns its own references.
++        for (unsigned i = 0; i < retiredCount; ++i) {
++            if (retired[i].s) ((OSObject *)retired[i].s)->release();
++            if (retired[i].pipe) ((OSObject *)retired[i].pipe)->release();
++        }
+     }
+-    nvAccelXeFlipDrop(&gXeFlipPrev);
+-    nvAccelXeFlipDrop(&gXeFlipFront);
++    if (__atomic_load_n(&gXeFlipBusy, __ATOMIC_ACQUIRE) == 0 && !gXeFlipUncertain) {
++        nvAccelXeFlipDrop(&gXeFlipPrev);
++        nvAccelXeFlipDrop(&gXeFlipFront);
++    } else {
++        ALOG("iop: live worker retains the front chain during pipe teardown");
++    }
+     IOAccelLegacyDisplayPipe::free();
+ }
+ 
+@@ -1564,14 +2461,15 @@
+     // K9: with the no-wait compositor this frame may still be under the GPU.  Hand it to the flip worker instead of
+     // waiting here: WindowServer's display thread stays free, and the worker writes PLANE_SURF only after the GPU
+     // reports idle.  The frame's geometry has to be the scanout's, as in the synchronous flip below.
+-    if (gIopXeDefer && gIopXeFlip && s && head == 4) {
++    if (gIopXeDefer && gIopXeFlip && s && head == 4 && nvXePlaneWriteAllowed(fb)) {
+         const unsigned W = (unsigned)s->getWidth(), H = (unsigned)s->getHeight(), P = (unsigned)s->getBytesPerRow();
+         if (W && H && W <= 16384 && H <= 16384 && P >= 4 * W && !(P & 3) && (unsigned long long)P * H <= 64ull * 1024 * 1024) {
+             struct NVRMVramRequest q;
+             for (unsigned i = 0; i < sizeof q; i++) ((volatile unsigned char *)&q)[i] = 0;
+             q.version = NVRM_VRAM_ABI_VERSION;
+             const IOReturn qr = a->askFramebufferForScanout(&q, fb);
+-            if (qr == kIOReturnSuccess && q.kva && q.pitch >= 4 && q.height && W == q.width && H == q.height) {
++            if (qr == kIOReturnSuccess && q.kva && q.pitch == P && q.height &&
++                W == q.width && H == q.height && s->getPixelFormat() == 0x42475241u) {
+                 nvAccelXeFlipDeferQueue(this, s, W, H, P);
+                 nvIopStat(&gIopTxnLastUs, &gIopTxnMaxUs, &gIopTxnSumUs, nvIopUsBetween(txnStart, mach_absolute_time()));
+                 gIopLastTxnEnd = mach_absolute_time();
+@@ -1611,7 +2509,10 @@
+         // stale, one-colour buffer on the panel every other frame: full-screen flicker, 5 of 40 flicker recordings
+         // (1.13-1.14.1), nvaccel_iop_blank about half of every copied frame, never on machines whose frames all flip.
+         // Such a frame now keeps the previous picture on the panel instead.
+-        nvSurfWaitReady(s->getSurfaceID());   // a copied frame is read here, so its GPU work must be done first
++        if (!nvSurfWaitReady(s->getSurfaceID())) {
++            OSAddAtomic64(1, &gCntIopLate);
++            return kIOReturnSuccess; // Keep prior pixels; timeout is not GPU completion.
++        }
+         if (!nvAccelSurfCopyReady(s, head)) return kIOReturnSuccess;
+         const unsigned fmt = s->getPixelFormat();
+         if (fmt != 0x42475241u) NVIOP_FAIL(kIOReturnUnsupported, "surface 0x%x format 0x%08x is not BGRA", s->getSurfaceID(), fmt);
+@@ -1637,7 +2538,7 @@
+     if (ret != kIOReturnSuccess || !q.kva || q.pitch < 4 || !q.height) NVIOP_FAIL(kIOReturnNotReady, "framebuffer would not describe its scanout (0x%x kva %p pitch %u)", (unsigned)ret, q.kva, q.pitch);
+     if (w != q.width || h != q.height) NVIOP_FAIL(kIOReturnBadArgument, "source %ux%u is not the scanout's %ux%u", w, h, q.width, q.height);
+ 
+-    if (!gIopXeDefer && gIopXeFlip && s && nvAccelXeFlip(fb, head, s, w, h, pitch)) {
++    if (!gIopXeDefer && gIopXeFlip && s && pitch == q.pitch && nvXePlaneWriteAllowed(fb) && nvAccelXeFlip(fb, head, s, w, h, pitch)) {
+         nvAccelIopHome(fb, head);
+         nvIopStat(&gIopTxnLastUs, &gIopTxnMaxUs, &gIopTxnSumUs, nvIopUsBetween(txnStart, mach_absolute_time()));
+         gIopLastTxnEnd = mach_absolute_time();
+@@ -1678,6 +2579,12 @@
+             for (unsigned x = 0; x < words; x++) dp[x] = sp[x];
+         }
+     }
++#ifdef NMX_XEGFX
++    if (nvXeIsKmsFB(fb) && nvXeRestoreCopyTarget(fb) != kIOReturnSuccess) {
++        OSAddAtomic64(1, &gCntIopLate);
++        return kIOReturnSuccess; // Keep the prior frame, without claiming a displayed copy.
++    }
++#endif
+     nvIopStat(&gIopCopyLastUs, &gIopCopyMaxUs, &gIopCopySumUs, nvIopUsBetween(copyStart, mach_absolute_time()));
+     if (gIopCopyLastUs > 12000) OSAddAtomic64(1, &gCntIopCopyOverrun);
+     {
+@@ -1717,16 +2624,14 @@
+     return kIOReturnSuccess;
+ }
+ 
+-static int nvacceliop_sysctl SYSCTL_HANDLER_ARGS
++// The body of debug.xegfxaccel_iop, shared with the boot-armed sequence so both take exactly the same actions.
++static void nvaccelSetIop(int v)
+ {
+-    int v = gNvIop;
+-    int err = sysctl_handle_int(oidp, &v, 0, req);
+-    if (err || req->newptr == 0) return err;
+     NVAccel *a = NVAccel::gAccel;
+-    if (!a) return ENXIO;
++    if (!a) return;
+     if (v) {
+         OSDictionary *caps = OSDictionary::withCapacity(2);
+-        if (!caps) return ENOMEM;
++        if (!caps) { ALOG("iop: OSDictionary::withCapacity failed -- capabilities NOT published"); return; }
+         caps->setObject("DisplayPipeSupported", kOSBooleanTrue);
+         caps->setObject("TransactionsSupported", kOSBooleanTrue);
+         a->setProperty("IOAccelDisplayPipeCapabilities", caps);
+@@ -1738,6 +2643,14 @@
+         a->removeProperty("IOAccelDisplayPipeCapabilities");
+         ALOG("iop: debug.xegfxaccel_iop=0 -- capabilities removed, transaction hooks answer as the base class");
+     }
++}
++static int nvacceliop_sysctl SYSCTL_HANDLER_ARGS
++{
++    int v = gNvIop;
++    int err = sysctl_handle_int(oidp, &v, 0, req);
++    if (err || req->newptr == 0) return err;
++    if (!NVAccel::gAccel) return ENXIO;
++    nvaccelSetIop(v);
+     return 0;
+ }
+ SYSCTL_PROC(_debug, OID_AUTO, nvaccel_iop, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN,
+@@ -1801,7 +2714,7 @@
+ NVACCEL_CNT(nvaccel_iop_xe_flip_miss, gCntXeFlipMiss,     "K8: flips skipped because the only free slot was the live one");
+ NVACCEL_CNT(nvaccel_iop_xe_flip_fail, gCntXeFlipFail,     "K8: zero-copy flips that fell back to the CPU copy");
+ static int    gIopFlip = 0;
+-static SInt64 gCntIopFlip, gCntIopFlipHome, gCntIopFlipNo[8];
++static SInt64 gCntIopFlip, gCntIopFlipNo[8];
+ SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_flip, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, &gIopFlip, 0, "1 = scan the composited IOSurface out of its own VRAM (no copy)");
+ NVACCEL_CNT(nvaccel_iop_flips,        gCntIopFlip,        "frames scanned out of the surface's own VRAM (zero copy)");
+ NVACCEL_CNT(nvaccel_iop_flip_home,    gCntIopFlipHome,    "flips back to the boot scanout before a copied frame");
+@@ -1908,13 +2821,231 @@
+ NVACCEL_CNT(nvaccel_iop_async_flips,   gCntIopAsync,        "swaps completed asynchronously");
+ NVACCEL_CNT(nvaccel_iop_async_refused, gCntIopAsyncRefused, "async swaps NVKMS refused (that frame stayed off the panel)");
+ NVACCEL_CNT(nvaccel_iop_async_drop,    gCntIopAsyncDrop,    "frames dropped because a flip was still in flight past a refresh period");
+-static SInt64 gCntIopLate;
+ NVACCEL_CNT(nvaccel_iop_late,          gCntIopLate,         "frames kept on the panel because the previous flip had not reached it yet (framebuffer answered busy)");
+ static int gCrcHead = 0;
+ SYSCTL_INT(_debug, OID_AUTO, nvaccel_crc_head, CTLFLAG_RW | CTLFLAG_LOCKED, &gCrcHead, 0, "b85k-crc: which head debug.xegfxaccel_crc reads");
+ static int nvaccel_crc_sysctl SYSCTL_HANDLER_ARGS;
+ SYSCTL_PROC(_debug, OID_AUTO, nvaccel_crc, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, nvaccel_crc_sysctl, "I",
+             "b85k-crc: display CRC32 of what head nvaccel_crc_head is showing (0 = unavailable)");
++#ifdef NMX_XEGFX
++// ---- M4a: boot-armed auto-configuration (docs/19-M4A-ACCEL.md) -----------------------------------------------
++// A boot that asks for it -- xegfxaccelboot=1 in the boot arguments, or "XeGfxBootArm" published on IOResources or
++// on this accelerator's provider -- gets the accelerated desktop armed by this kext itself: the same actions
++// userspace drives by hand (igpu=1, fb=1, fb=3, iop=1, flip=1) run in a kernel thread, before loginwindow and
++// WindowServer ask for a Metal device, so no manual sysctl and no WindowServer restart is needed.  Every wait is
++// bounded and a failure is logged and published, never a panic: the display then stays on whichever framebuffer
++// owns the panel (IntelFB / the placeholder / the KMS adapter) and the manual path is still there.
++static uint64_t nvBootMsSince(uint64_t t0)
++{
++    uint64_t ns = 0;
++    absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++    return ns / 1000000ULL;
++}
++static bool nvBootTruthy(OSObject *o)
++{
++    if (!o || o == kOSBooleanFalse) return false;
++    if (OSNumber *n = OSDynamicCast(OSNumber, o)) return n->unsigned32BitValue() != 0;
++    return true;   // a plain published marker counts as on (publishResource("XeGfxArm") publishes "IOService")
++}
++bool NVAccel::bootArmRequested(const char **why, int *source)
++{
++    int v = 0;
++    if (PE_parse_boot_argn("xegfxaccelboot", &v, sizeof v) && v) {
++        *why = "boot argument xegfxaccelboot=1"; *source = 1; return true;
++    }
++    char flag = 0;
++    if (PE_parse_boot_argn("-xegfxaccelboot", &flag, sizeof flag)) {
++        *why = "boot argument -xegfxaccelboot"; *source = 1; return true;
++    }
++    if (IOService *res = IOService::getResourceService()) {
++        if (nvBootTruthy(res->getProperty("XeGfxBootArm"))) {
++            *why = "IOResources XeGfxBootArm"; *source = 2; return true;
++        }
++    }
++    if (IOService *prov = getProvider()) {
++        if (nvBootTruthy(prov->getProperty("XeGfxBootArm"))) {
++            *why = "provider XeGfxBootArm"; *source = 3; return true;
++        }
++    }
++    return false;
++}
++bool NVAccel::bootHeadReady(const char **cls, const char **gate)
++{
++    IOService *cand = nullptr;
++    if (fFBs[4] && xgXeGfxFBGate(fFBs[4])) cand = fFBs[4];        // the placeholder and the adapter both want head 4
++    else if (fKmsFB && xgXeGfxFBGate(fKmsFB)) cand = fKmsFB;       // the adapter parked by fbPublished
++    else if (fFB && xgXeGfxFBGate(fFB)) cand = fFB;                // whichever became primary
++    if (!cand) return false;
++    if (cls) *cls = xgXeGfxFBClass(cand);
++    if (gate) *gate = xgXeGfxFBGate(cand);
++    return true;
++}
++void NVAccel::bootArmStart(const char *why, int source)
++{
++    if (fBootArmed == 1) { ALOG("boot-armed: already running -- ignoring %s", why); return; }
++    if (gBootArmState == 2) { ALOG("boot-armed: already READY -- ignoring %s", why); return; }
++    fBootArmed = 1; gBootArmState = 1; gBootArmReason = source; gBootArmSteps = 0;
++    setProperty("XeGfxAccelBootArm", why);
++    setProperty("XeGfxAccelBootReady", kOSBooleanFalse);
++    setProperty("XeGfxAccelBootAgdc", kOSBooleanFalse);
++    if (fPCI) fPCI->setProperty("XeGfxAccelBootArm", kOSBooleanTrue);
++    retain();   // the thread outlives this call and releases this reference at its end
++    thread_t th = nullptr;
++    if (kernel_thread_start(&NVAccel::bootArmThread, this, &th) != KERN_SUCCESS || !th) {
++        fBootArmed = 2; gBootArmState = 3; release();
++        setProperty("XeGfxAccelBootFailure", "kernel_thread_start failed");
++        if (fPCI) fPCI->setProperty("XeGfxAccelBootReady", kOSBooleanFalse);
++        ALOG("boot-armed: kernel_thread_start FAILED -- this boot stays on the manual path "
++             "(debug.xegfxaccelfb=1, then debug.xegfxaccelfb=3, then debug.xegfxaccel_iop=1)");
++        return;
++    }
++    thread_deallocate(th);
++    ALOG("boot-armed: ARMED by %s (source %d) -- kernel thread %p; sequence in %d ms, head wait %d ms, budget %d s",
++         why, source, th, gBootArmDelayMs, gBootArmHeadWaitMs, gBootArmBudgetMs / 1000);
++}
++void NVAccel::bootArmThread(void *p0, int resume)
++{
++    (void)resume;
++    NVAccel *me = (NVAccel *)p0;
++    if (me && me == gAccel)
++        me->bootArmRun();
++    else if (me) {
++        gBootArmState = 3;
++        me->setProperty("XeGfxAccelBootReady", kOSBooleanFalse);
++        me->setProperty("XeGfxAccelBootFailure", "the accelerator stopped before the boot sequence ran");
++        ALOG("boot-armed: this accelerator is no longer the live one -- sequence skipped");
++    }
++    if (me) me->release();
++}
++void NVAccel::bootArmFinish(int ok, const char *msg)
++{
++    fBootArmed = 2;
++    gBootArmState = ok ? 2 : 3;
++    setProperty("XeGfxAccelBootSteps", gBootArmSteps, 32);
++    setProperty("XeGfxAccelBootReady", ok ? kOSBooleanTrue : kOSBooleanFalse);
++    if (fPCI) fPCI->setProperty("XeGfxAccelBootReady", ok ? kOSBooleanTrue : kOSBooleanFalse);
++    if (ok) return;
++    setProperty("XeGfxAccelBootFailure", msg ? msg : "unspecified");
++    ALOG("boot-armed: FAILED -- %s (steps 0x%x, published 0x%x, registered 0x%x, piped 0x%x, igpu %d, fb %d, iop %d, "
++         "flip %d/defer %d). Nothing was torn down and the accelerator stays inert, so WindowServer keeps whichever "
++         "framebuffer owns the panel: IntelFB, the placeholder or XeGfxFramebuffer is still the safe display. Retry by "
++         "hand: debug.xegfxaccelfb=1, debug.xegfxaccelfb=3, debug.xegfxaccel_iop=1",
++         msg ? msg : "unspecified", (unsigned)gBootArmSteps, gNvHeadsPublished, gNvHeadsRegistered, gNvHeadsPiped,
++         gNvIgpu, gNvAccelArmed, gNvIop, gIopXeFlip, gIopXeDefer);
++}
++void NVAccel::bootArmRun(void)
++{
++    char msg[224];
++    const uint64_t t0 = mach_absolute_time();
++    const int budget = gBootArmBudgetMs;
++    ALOG("boot-armed: sequence starts (delay %d ms, budget %d s); the manual sysctls keep working", gBootArmDelayMs,
++         budget / 1000);
++    IOSleep(gBootArmDelayMs);   // AGDC and the display machine finish their own early MMIO work first
++    if (!fRegLock || !fDM) { bootArmFinish(0, "no registration lock or no display machine"); return; }
++
++    // 1/6: a head must be published AND through its start gate.  Registering one earlier is what crashed
++    // IOFramebuffer::getAttributeExt, so this wait is the price of the whole path.
++    const char *cls = nullptr, *gate = nullptr;
++    unsigned waited = 0;
++    while (!bootHeadReady(&cls, &gate)) {
++        if (waited >= (unsigned)gBootArmHeadWaitMs || nvBootMsSince(t0) >= (uint64_t)budget) {
++            snprintf(msg, sizeof msg, "no XeGfx framebuffer with an open start gate after %u ms (published 0x%x): the "
++                     "display stack never came up this boot", waited, gNvHeadsPublished);
++            bootArmFinish(0, msg); return;
++        }
++        IOSleep(250); waited += 250;
++    }
++    ALOG("boot-armed: 1/6 head gate open after %u ms (%s, %s); published 0x%x registered 0x%x piped 0x%x", waited, cls,
++         gate, gNvHeadsPublished, gNvHeadsRegistered, gNvHeadsPiped);
++
++    // 2/6: igpu=1 -- head 4 is the Intel panel (already the XeGfx default; kept explicit so the log says so)
++    gNvIgpu = 1; gBootArmSteps |= 0x01;
++    ALOG("boot-armed: 2/6 debug.xegfxaccel_igpu=1 (head 4 = the Intel panel)");
++
++    // 3/6: fb=1 -- register the published head that has no pipe yet
++    if (!gAccel) { bootArmFinish(0, "the accelerator went away before registration"); return; }
++    gAccel->triggerFromSysctl(1);
++    waited = 0;
++    while (!(gNvHeadsRegistered & 0x10u) && waited < (unsigned)gBootArmHeadWaitMs && nvBootMsSince(t0) < (uint64_t)budget) {
++        IOSleep(200); waited += 200;
++    }
++    if (!(gNvHeadsRegistered & 0x10u)) {
++        snprintf(msg, sizeof msg, "fb=1 did not register head 4 within %u ms (published 0x%x registered 0x%x)",
++                 gBootArmHeadWaitMs, gNvHeadsPublished, gNvHeadsRegistered);
++        bootArmFinish(0, msg); return;
++    }
++    gBootArmSteps |= 0x02;
++    ALOG("boot-armed: 3/6 debug.xegfxaccelfb=1 -> head 4 registered (0x%x) after %u ms", gNvHeadsRegistered, waited);
++
++    // 4/6: fb=3 -- scan-out backed pipe, plus the family's mode-change delivery
++    gAccel->triggerFromSysctl(3);
++    waited = 0;
++    while (!(gNvHeadsPiped & 0x10u) && waited < (unsigned)gBootArmPipeWaitMs && nvBootMsSince(t0) < (uint64_t)budget) {
++        IOSleep(250); waited += 250;
++    }
++    if (!(gNvHeadsPiped & 0x10u)) {
++        snprintf(msg, sizeof msg, "fb=3 gave head 4 no display pipe within %u ms (registered 0x%x piped 0x%x)",
++                 gBootArmPipeWaitMs, gNvHeadsRegistered, gNvHeadsPiped);
++        bootArmFinish(0, msg); return;
++    }
++    if (!gNvAccelArmed) {
++        bootArmFinish(0, "head registered but mode-change delivery did not arm Metal"); return;
++    }
++    gBootArmSteps |= 0x08;
++    ALOG("boot-armed: 4/6 debug.xegfxaccelfb=3 -> head 4 has a display pipe (piped 0x%x) after %u ms", gNvHeadsPiped, waited);
++
++    // 5/6: iop=1 -- publish IOAccelDisplayPipeCapabilities so WindowServer may use the pipe
++    nvaccelSetIop(1);
++    if (!gNvIop) { bootArmFinish(0, "debug.xegfxaccel_iop=1 did not take"); return; }
++    gBootArmSteps |= 0x10;
++    ALOG("boot-armed: 5/6 debug.xegfxaccel_iop=1 -> display-pipe capabilities published, transaction hooks OPEN");
++
++    // 6/6: the K9b deferred zero-copy flip (what the working manual config arms: flip + defer + idle wait)
++    gIopXeFlip = 1; gIopXeDefer = 1; gIopXeWaitIdle = 1; gIopXeReportBusy = 1; gIopXeIdleMs = 40;
++    gBootArmSteps |= 0x20;
++    ALOG("boot-armed: 6/6 debug.xegfxaccel_iop_xe_flip=1 + debug.xegfxaccel_iop_xe_defer=1 (wait_idle 1, idle_ms 40, "
++         "report_busy 1)");
++
++    // AGDC (debug.xegfx_agdc=1 + debug.xegfx_agdc_k5=1) belongs to org.watchthelight.XeGfxAGDC: a kext cannot write
++    // another kext's sysctls, so the request is published on the GPU node instead and the fact is recorded as its own
++    // property rather than as a failure.  M4b should make the AGDC kext read this request in its start().
++    if (fPCI) fPCI->setProperty("XeGfxAccelAgdcRequest", kOSBooleanTrue);
++    setProperty("XeGfxAccelBootNote", "AGDC arming (debug.xegfx_agdc=1, debug.xegfx_agdc_k5=1) belongs to "
++                "org.watchthelight.XeGfxAGDC and cannot be written from this kext; XeGfxAccelAgdcRequest marks it");
++    gBootArmSteps |= 0x40;
++    ALOG("boot-armed: AGDC request left on the GPU node (XeGfxAccelAgdcRequest=1); debug.xegfx_agdc/_k5 still need "
++         "org.watchthelight.XeGfxAGDC or a boot helper");
++
++    setProperty("XeGfxAccelBootTookMs", (int)nvBootMsSince(t0), 32);
++    bootArmFinish(1, nullptr);
++    ALOG("boot-armed: READY in %llu ms -- head 4 registered and piped, scanout %d aperture %d, iop/flip/defer armed; "
++         "awaiting WindowServer desktop validation", (unsigned long long)nvBootMsSince(t0), gNvScanout, gNvAperture);
++}
++static int nvaccelboot_sysctl SYSCTL_HANDLER_ARGS
++{
++    int v = gBootArmState;
++    int err = sysctl_handle_int(oidp, &v, 0, req);
++    if (err || req->newptr == 0) return err;
++    if (v != 1) return EINVAL;
++    if (!NVAccel::gAccel) return ENXIO;
++    NVAccel::gAccel->bootArmStart("debug.xegfxaccel_boot=1", 4);
++    return 0;
++}
++SYSCTL_PROC(_debug, OID_AUTO, nvaccel_boot, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN,
++            NULL, 0, nvaccelboot_sysctl, "I",
++            "1 = run the boot-armed sequence now (the actions the boot helper does by hand); reads 0 idle, 1 running, "
++            "2 ready, 3 failed");
++SYSCTL_INT(_debug, OID_AUTO, nvaccel_boot_steps, CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN, &gBootArmSteps, 0,
++           "boot-armed progress: 1 igpu, 2 fb=1, 4 head registered, 8 fb=3, 16 pipe, 32 iop, 64 flip, 128 AGDC request");
++SYSCTL_INT(_debug, OID_AUTO, nvaccel_boot_delay_ms, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, &gBootArmDelayMs, 0,
++           "boot-armed: how long the sequence waits before step 1 so AGDC and the display machine come up first");
++SYSCTL_INT(_debug, OID_AUTO, nvaccel_boot_head_wait_ms, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, &gBootArmHeadWaitMs, 0,
++           "boot-armed: how long step 1 waits for a XeGfx framebuffer with an open start gate");
++SYSCTL_INT(_debug, OID_AUTO, nvaccel_boot_pipe_wait_ms, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, &gBootArmPipeWaitMs, 0,
++           "boot-armed: how long step 4 waits for the display pipe after fb=3");
++SYSCTL_INT(_debug, OID_AUTO, nvaccel_boot_budget_ms, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, &gBootArmBudgetMs, 0,
++           "boot-armed: hard budget for the whole sequence (default 90000)");
++#endif
+ static bool gSysctlInstalled = false;
+ static void nvaccelInstallSysctl(void)
+ {
+@@ -1988,8 +3119,9 @@
+       sysctl_register_oid(&sysctl__debug_nvaccel_iop_vblank);          sysctl_register_oid(&sysctl__debug_nvaccel_iop_vblank_waits);
+       sysctl_register_oid(&sysctl__debug_nvaccel_iop_vblank_skips);    sysctl_register_oid(&sysctl__debug_nvaccel_iop_vblank_last_us);
+       sysctl_register_oid(&sysctl__debug_nvaccel_iop_vblank_max_us); }
+-    { extern struct sysctl_oid sysctl__debug_nvaccel_iop_xe_flip, sysctl__debug_nvaccel_iop_xe_flip_miss,
++    { extern struct sysctl_oid sysctl__debug_nvaccel_iop_xe_flip, sysctl__debug_nvaccel_iop_xe_flips, sysctl__debug_nvaccel_iop_xe_flip_miss,
+           sysctl__debug_nvaccel_iop_xe_flip_fail;
++      sysctl_register_oid(&sysctl__debug_nvaccel_iop_xe_flips);   // Intel successes; generic iop_flips counts NVIDIA flips
+       sysctl_register_oid(&sysctl__debug_nvaccel_iop_xe_flip);      sysctl_register_oid(&sysctl__debug_nvaccel_iop_xe_flip_miss);
+       sysctl_register_oid(&sysctl__debug_nvaccel_iop_xe_flip_fail); }
+     { extern struct sysctl_oid sysctl__debug_nvaccel_iop_xe_defer, sysctl__debug_nvaccel_iop_xe_wait_idle,
+@@ -2022,6 +3154,32 @@
+ #endif
+     sysctl_register_oid(&sysctl__debug_nvaccel_heads_published); sysctl_register_oid(&sysctl__debug_nvaccel_heads_registered);
+     sysctl_register_oid(&sysctl__debug_nvaccel_heads_piped);
++#ifdef NMX_XEGFX
++    // M4a: the boot-armed sequence (docs/19-M4A-ACCEL.md)
++    sysctl_register_oid(&sysctl__debug_nvaccel_boot);
++    sysctl_register_oid(&sysctl__debug_nvaccel_boot_steps);
++    sysctl_register_oid(&sysctl__debug_nvaccel_boot_delay_ms);    sysctl_register_oid(&sysctl__debug_nvaccel_boot_head_wait_ms);
++    sysctl_register_oid(&sysctl__debug_nvaccel_boot_pipe_wait_ms); sysctl_register_oid(&sysctl__debug_nvaccel_boot_budget_ms);
++    // M3d: the adapter present path (docs/20-M3D-ACCEL.md)
++    { extern struct sysctl_oid sysctl__debug_nvaccel_present;
++      sysctl_register_oid(&sysctl__debug_nvaccel_present); }
++    { extern struct sysctl_oid sysctl__debug_nvaccel_present_ok, sysctl__debug_nvaccel_present_fail,
++          sysctl__debug_nvaccel_present_busy, sysctl__debug_nvaccel_present_not_ready,
++          sysctl__debug_nvaccel_present_badarg, sysctl__debug_nvaccel_present_latch_timeouts,
++          sysctl__debug_nvaccel_present_ggtt_writes, sysctl__debug_nvaccel_present_phys_writes,
++          sysctl__debug_nvaccel_present_last_us, sysctl__debug_nvaccel_present_max_us;
++      sysctl_register_oid(&sysctl__debug_nvaccel_present_ok);           sysctl_register_oid(&sysctl__debug_nvaccel_present_fail);
++      sysctl_register_oid(&sysctl__debug_nvaccel_present_busy);         sysctl_register_oid(&sysctl__debug_nvaccel_present_not_ready);
++      sysctl_register_oid(&sysctl__debug_nvaccel_present_badarg);       sysctl_register_oid(&sysctl__debug_nvaccel_present_latch_timeouts);
++      sysctl_register_oid(&sysctl__debug_nvaccel_present_ggtt_writes);  sysctl_register_oid(&sysctl__debug_nvaccel_present_phys_writes);
++      sysctl_register_oid(&sysctl__debug_nvaccel_present_last_us);      sysctl_register_oid(&sysctl__debug_nvaccel_present_max_us); }
++    { extern struct sysctl_oid sysctl__debug_nvaccel_vblank_reads, sysctl__debug_nvaccel_vblank_wraps,
++          sysctl__debug_nvaccel_scanout_kms_ok, sysctl__debug_nvaccel_scanout_kms_not_ready,
++          sysctl__debug_nvaccel_cursor_requests;
++      sysctl_register_oid(&sysctl__debug_nvaccel_vblank_reads);         sysctl_register_oid(&sysctl__debug_nvaccel_vblank_wraps);
++      sysctl_register_oid(&sysctl__debug_nvaccel_scanout_kms_ok);       sysctl_register_oid(&sysctl__debug_nvaccel_scanout_kms_not_ready);
++      sysctl_register_oid(&sysctl__debug_nvaccel_cursor_requests); }
++#endif
+     gSysctlInstalled = true;
+     ALOG("sysctl debug.xegfxaccelfb installed -- `sudo sysctl -w debug.xegfxaccelfb=1` registers the framebuffer");
+ #endif
+@@ -2739,7 +3897,16 @@
+     }
+     if (head >= kNvMaxFB) return true;
+     if (ready) { gIopCopyHeld[head] = 0; return true; }
+-    if (++gIopCopyHeld[head] > 4) { gIopCopyHeld[head] = 0; return true; }
++    if (++gIopCopyHeld[head] > 4) {
++#ifdef NMX_XEGFX
++        if (head == 4 && nvXeIsKmsFB(a->fFB)) {
++            gIopCopyHeld[head] = 4;
++            OSAddAtomic64(1, &gCntIopCopySkip);
++            return false; // Repeated failure does not make stale CPU backing ready.
++        }
++#endif
++        gIopCopyHeld[head] = 0; return true;
++    }
+     OSAddAtomic64(1, &gCntIopCopySkip);
+     return false;
+ }
+@@ -3025,6 +4192,25 @@
+ SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_iop_vblank_skips, CTLFLAG_RD | CTLFLAG_LOCKED, &gCntIopVblankSkips, "frames copied without a vblank wait (no MMIO, gate off, or timeout)");
+ SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_iop_vblank_last_us, CTLFLAG_RD | CTLFLAG_LOCKED, &gIopVblankLastUs, "wait for the last vblank, us");
+ SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_iop_vblank_max_us, CTLFLAG_RD | CTLFLAG_LOCKED, &gIopVblankMaxUs, "longest vblank wait, us");
++// M3d: the adapter present path (docs/20-M3D-ACCEL.md).  `debug.xegfxaccel_present` is the one switch to turn the
++// adapter's register writes off without touching anything else; the counters say what the adapter asked for.
++SYSCTL_INT(_debug, OID_AUTO, nvaccel_present, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, &gXePresent, 0,
++           "M3d: accept adapter xgFlipPresent calls (1) or leave the plane untouched (0)");
++SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_present_ok, CTLFLAG_RD | CTLFLAG_LOCKED, &gCntPresentOk, "adapter frames programmed on head 4");
++SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_present_fail, CTLFLAG_RD | CTLFLAG_LOCKED, &gCntPresentFail, "adapter presents that failed (previous frame kept)");
++SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_present_busy, CTLFLAG_RD | CTLFLAG_LOCKED, &gCntPresentBusy, "adapter presents refused because the K9b flip worker owns the plane");
++SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_present_not_ready, CTLFLAG_RD | CTLFLAG_LOCKED, &gCntPresentNotReady, "adapter presents before XeGfxFbReady (no register write)");
++SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_present_badarg, CTLFLAG_RD | CTLFLAG_LOCKED, &gCntPresentBadArg, "adapter presents that did not fit the contract");
++SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_present_latch_timeouts, CTLFLAG_RD | CTLFLAG_LOCKED, &gCntPresentLatchTimeouts, "adapter presents written but not latched inside 25 ms (previous frame put back)");
++SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_present_ggtt_writes, CTLFLAG_RD | CTLFLAG_LOCKED, &gCntPresentGgttWrites, "adapter presents programmed by a direct GGTT offset");
++SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_present_phys_writes, CTLFLAG_RD | CTLFLAG_LOCKED, &gCntPresentPhysWrites, "adapter presents programmed through a reserved GGTT slot");
++SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_present_last_us, CTLFLAG_RD | CTLFLAG_LOCKED, &gXePresentLastUs, "last adapter present, us (map + plane write + latch)");
++SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_present_max_us, CTLFLAG_RD | CTLFLAG_LOCKED, &gXePresentMaxUs, "slowest adapter present, us");
++SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_vblank_reads, CTLFLAG_RD | CTLFLAG_LOCKED, &gCntVblankReads, "xgVblankCount/xgVblankTime reads that observed a new frame");
++SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_vblank_wraps, CTLFLAG_RD | CTLFLAG_LOCKED, &gCntVblankWraps, "frame-counter 32-bit wraps the accelerator extended");
++SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_scanout_kms_ok, CTLFLAG_RD | CTLFLAG_LOCKED, &gCntKmsScanoutOk, "xgGetScanoutInfo imports of the adapter scanout");
++SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_scanout_kms_not_ready, CTLFLAG_RD | CTLFLAG_LOCKED, &gCntKmsScanoutNotReady, "xgGetScanoutInfo answers that were not ready");
++SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_cursor_requests, CTLFLAG_RD | CTLFLAG_LOCKED, &gCntCursorRequests, "xgCursorImage requests (skeleton: validated, not programmed)");
+ // how far CoreDisplay gets with the display pipe (thanhnndev: it submits transactions only after AGDC 0x2001 is accepted)
+ SInt64 gCntPipeInit, gCntPipeValidate, gCntPipeComplete, gCntPipePerform;
+ SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_pipe_init, CTLFLAG_RD | CTLFLAG_LOCKED, &gCntPipeInit, "NVDisplayPipe::initFramebufferResource calls");
+@@ -3098,6 +4284,16 @@
+     }
+ 
+ #ifdef NMX_XEGFX
++    if (nvXeIsKmsFB(a->fFB) &&
++        (w != q.width || h != q.height || (pitch & 3u) || (q.pitch & 3u) || pitch < (uint64_t)w * 4 ||
++         q.pitch < (uint64_t)q.width * 4 || vm->fBytes < (uint64_t)pitch * h ||
++         q.actualSize < (uint64_t)q.pitch * q.height)) {
++        NVFLIPWHY("copyToScanout: KMS geometry or backing length mismatch -- frame rejected");
++        return false;
++    }
++#endif
++
++#ifdef NMX_XEGFX
+     // a swap with an empty a2 names the scanout itself (a1): copying it onto itself reads 16 MB of write-combined
+     // memory, ~0.8 s on ws_main_thread every other swap (N-255..N-280), and changes nothing on the panel
+     if (vm->fScanout || (const void *)vm->fKva == (const void *)q.kva) {
+@@ -3138,6 +4334,19 @@
+     return true;
+ }
+ 
++#ifdef NMX_XEGFX
++bool nvAccelXeSwapCopy(IOAccelResource2 *source)
++{
++    NVAccel *a = NVAccel::gAccel;
++    if (!a || !nvXeIsKmsFB(a->fFB)) return false;
++    // submitSwapCopy's second resource is the completed composite. A black
++    // frame is valid; the old front buffer is never a substitute for it.
++    if (!nvAccelCopyToScanout(source))
++        NVFLIPWHY("KMS swap: no valid completed swap source; keeping the previous frame");
++    return true; // Handled even on rejection: never fall back to the old front.
++}
++#endif
++
+ static bool nvAccelFlipTo(IOAccelResource2 *res)
+ {
+     if (!res) { NVFLIPWHY("nvAccelFlipTo: no resource"); return false; }
+@@ -3184,6 +4393,20 @@
+ {
+     if (fn && p1 && fn->isEqualTo(NVACCEL_SS_FN))
+         return nvAccelSurfVram((struct NVRMSurfShareEsc *)p1, (task_t)p2, (unsigned)(uintptr_t)p3);
++#ifdef NMX_XEGFX
++    // M3d: the adapter -> accelerator direction (XeGfxDisplay.kext finds this object through the XeGfxAccelPresent
++    // property).  These are the only entry points that can write PLANE_SURF_1_A on the adapter's behalf; each one is
++    // gated by nvXePresentReady() (XeGfxFbReady), so a call before the adapter has claimed its mode and scanout
++    // touches no register.  Contract and error codes: docs/20-M3D-ACCEL.md.  xgFlipPresent may block up to ~25 ms
++    // (vblank latch wait) and must be called from thread context; flags bit1 makes it return immediately.
++    if (fn) {
++        if (fn->isEqualTo("xgFlipPresent"))     return nvXePresent((struct XeGfxPresent *)p1);
++        if (fn->isEqualTo("xgVblankCount"))     return nvXeVblankCount(p1, p2);
++        if (fn->isEqualTo("xgVblankTime"))      return nvXeVblankTime(p1, p2);
++        if (fn->isEqualTo("xgGetPresentInfo"))  return nvXeGetPresentInfo((struct XeGfxPresentInfo *)p1);
++        if (fn->isEqualTo("xgCursorImage"))     return nvXeCursor((struct XeGfxCursorImage *)p1);
++    }
++#endif
+     return IOService::callPlatformFunction(fn, wait, p1, p2, p3, p4);
+ }
+ 
+--- a/kexts/NVRM/accel/xe/Info.plist
++++ b/kexts/NVRM/accel/xe/Info.plist
+@@ -35,8 +35,8 @@
+ 			<key>IOPropertyMatch</key><dict><key>nmxgpu-claimed</key><true/></dict>
+ 			<key>IOMatchCategory</key><string>IOAccelerator</string>
+ 			<key>IOProbeScore</key><integer>100</integer>
+-			<key>MetalPluginName</key><string>../../../Library/GPUBundles/NVMTLDriver</string>
+-			<key>MetalPluginClassName</key><string>NVMTLDevice</string>
++			<key>MetalPluginName</key><string>../../../Library/GPUBundles/XeMTLDriver</string>
++			<key>MetalPluginClassName</key><string>XeMTLDevice</string>
+ 		</dict>
+ 	</dict>
+ </dict>
+--- a/kexts/NVRM/accel/xegfx_accel_names.h
++++ b/kexts/NVRM/accel/xegfx_accel_names.h
+@@ -223,4 +223,53 @@
+ #define sysctl__debug_nvaccel_iop_xe_flip_miss sysctl__debug_xegfxaccel_iop_xe_flip_miss
+ #define nvaccel_iop_xe_flip_fail xegfxaccel_iop_xe_flip_fail
+ #define sysctl__debug_nvaccel_iop_xe_flip_fail sysctl__debug_xegfxaccel_iop_xe_flip_fail
++// M4a: boot-armed auto-configuration.  debug.xegfxaccel_boot=1 runs the sequence by hand (the boot argument
++// xegfxaccelboot=1 does it without userspace); the *_ms knobs tune the waits, boot_steps reports progress.
++#define nvaccel_boot xegfxaccel_boot
++#define sysctl__debug_nvaccel_boot sysctl__debug_xegfxaccel_boot
++#define nvaccel_boot_steps xegfxaccel_boot_steps
++#define sysctl__debug_nvaccel_boot_steps sysctl__debug_xegfxaccel_boot_steps
++#define nvaccel_boot_delay_ms xegfxaccel_boot_delay_ms
++#define sysctl__debug_nvaccel_boot_delay_ms sysctl__debug_xegfxaccel_boot_delay_ms
++#define nvaccel_boot_head_wait_ms xegfxaccel_boot_head_wait_ms
++#define sysctl__debug_nvaccel_boot_head_wait_ms sysctl__debug_xegfxaccel_boot_head_wait_ms
++#define nvaccel_boot_pipe_wait_ms xegfxaccel_boot_pipe_wait_ms
++#define sysctl__debug_nvaccel_boot_pipe_wait_ms sysctl__debug_xegfxaccel_boot_pipe_wait_ms
++#define nvaccel_boot_budget_ms xegfxaccel_boot_budget_ms
++#define sysctl__debug_nvaccel_boot_budget_ms sysctl__debug_xegfxaccel_boot_budget_ms
++// M3d: the adapter <-> accelerator present contract (docs/20-M3D-ACCEL.md). debug.xegfxaccel_present is the master
++// switch for the framebuffer->accelerator direction; the counters say what the adapter asked for and what happened.
++#define nvaccel_present xegfxaccel_present
++#define sysctl__debug_nvaccel_present sysctl__debug_xegfxaccel_present
++#define nvaccel_present_ok xegfxaccel_present_ok
++#define sysctl__debug_nvaccel_present_ok sysctl__debug_xegfxaccel_present_ok
++#define nvaccel_present_fail xegfxaccel_present_fail
++#define sysctl__debug_nvaccel_present_fail sysctl__debug_xegfxaccel_present_fail
++#define nvaccel_present_busy xegfxaccel_present_busy
++#define sysctl__debug_nvaccel_present_busy sysctl__debug_xegfxaccel_present_busy
++#define nvaccel_present_not_ready xegfxaccel_present_not_ready
++#define sysctl__debug_nvaccel_present_not_ready sysctl__debug_xegfxaccel_present_not_ready
++#define nvaccel_present_badarg xegfxaccel_present_badarg
++#define sysctl__debug_nvaccel_present_badarg sysctl__debug_xegfxaccel_present_badarg
++#define nvaccel_present_latch_timeouts xegfxaccel_present_latch_timeouts
++#define sysctl__debug_nvaccel_present_latch_timeouts sysctl__debug_xegfxaccel_present_latch_timeouts
++#define nvaccel_present_ggtt_writes xegfxaccel_present_ggtt_writes
++#define sysctl__debug_nvaccel_present_ggtt_writes sysctl__debug_xegfxaccel_present_ggtt_writes
++#define nvaccel_present_phys_writes xegfxaccel_present_phys_writes
++#define sysctl__debug_nvaccel_present_phys_writes sysctl__debug_xegfxaccel_present_phys_writes
++#define nvaccel_present_last_us xegfxaccel_present_last_us
++#define sysctl__debug_nvaccel_present_last_us sysctl__debug_xegfxaccel_present_last_us
++#define nvaccel_present_max_us xegfxaccel_present_max_us
++#define sysctl__debug_nvaccel_present_max_us sysctl__debug_xegfxaccel_present_max_us
++#define nvaccel_vblank_reads xegfxaccel_vblank_reads
++#define sysctl__debug_nvaccel_vblank_reads sysctl__debug_xegfxaccel_vblank_reads
++#define nvaccel_vblank_wraps xegfxaccel_vblank_wraps
++#define sysctl__debug_nvaccel_vblank_wraps sysctl__debug_xegfxaccel_vblank_wraps
++#define nvaccel_scanout_kms_ok xegfxaccel_scanout_kms_ok
++#define sysctl__debug_nvaccel_scanout_kms_ok sysctl__debug_xegfxaccel_scanout_kms_ok
++#define nvaccel_scanout_kms_not_ready xegfxaccel_scanout_kms_not_ready
++#define sysctl__debug_nvaccel_scanout_kms_not_ready sysctl__debug_xegfxaccel_scanout_kms_not_ready
++#define nvaccel_cursor_requests xegfxaccel_cursor_requests
++#define sysctl__debug_nvaccel_cursor_requests sysctl__debug_xegfxaccel_cursor_requests
++
+ #endif

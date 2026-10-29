@@ -1,0 +1,29 @@
+# 0014 XeGfxIntelFB: publish XeGfxL0Ready once start() has returned
+#
+# Base:  kexts/XeGfxIntelFB after 0003 + 0010
+# Files: kexts/XeGfxIntelFB/intelfb.cpp
+# Apply: patch -p1 < patches/0014-intelfb-l0-ready.patch
+#
+# Problem: the accelerator registering this framebuffer's display pipe delivers a mode change, which asks
+# IOFramebuffer for attributes; asked before start() returned, the kernel panicked (2026-10-27).
+# Fix: XeGfxL0Ready=true is set after IONDRVFramebuffer::start() and the detailed timings; the boot daemon and the
+# boot-armed accelerator wait for it.
+#
+--- a/kexts/XeGfxIntelFB/intelfb.cpp
++++ b/kexts/XeGfxIntelFB/intelfb.cpp
+@@ -355,7 +355,14 @@
+         const bool started = IONDRVFramebuffer::start(provider);
+         // re-publish after the base class has built its mode list: the property is read with the other
+         // framebuffer properties, and being present is what stops CoreDisplay from recording IOFB0Hz
+-        if (started) xifbPublishDetailedTimings();
++        if (started) {
++            xifbPublishDetailedTimings();
++            // The accelerator may take this framebuffer's display pipe only after this point: delivering the
++            // mode change asks IOFramebuffer for attributes and a framebuffer whose start has not returned is
++            // not safe to ask (kernel panics on 2026-10-27).  The boot daemon waits for this property.
++            if (setProperty("XeGfxL0Ready", kOSBooleanTrue))
++                XIFBLOG("start complete: XeGfxL0Ready published -- the accelerator may register this framebuffer now");
++        }
+         return started;
+     }
+     void stop(IOService *provider) override {
