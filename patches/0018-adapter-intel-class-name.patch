@@ -1,0 +1,66 @@
+# 0018 XeGfxDisplay: instantiate XeGfxIntelKMSFramebuffer so CoreDisplay enables IOPresentment
+#
+# Base:  the XeGfxDisplay KMS adapter b4e22af6 (0015)
+# Files: kexts/XeGfxDisplay/src/XeGfxDisplay.h, kexts/XeGfxDisplay/src/XeGfxDisplay.cpp, kexts/XeGfxDisplay/Info.plist
+# Apply: patch -p1 < patches/0018-adapter-intel-class-name.patch
+#
+# Problem: every WindowServer crashed on the CA::OGL::Context::push_surface assertion ("transient surface ... not
+# found").  CoreDisplay's GetGPUVendorForFramebufferService() classifies each IOFramebuffer by its C++ class name
+# ("Intel" / "AMD" / "NVDA" / "AppleParavirt"); XeGfxFramebuffer matched none, the vendor mask became 0,
+# UseIOPresentment() silently cleared useIOP, the display used the legacy CGXDisplayDevice surface and
+# CompositorSW, and the software context imports flattened IOSurfaces without tracking them.
+# Fix: an empty subclass whose name contains "Intel" is the IOClass.  Behaviour stays in XeGfxFramebuffer;
+# serviceMatching/metaCast/ioreg -c lookups of XeGfxFramebuffer still match it.  Not XeGfxIntelFramebuffer: that
+# name belongs to the XeGfxIntelFB placeholder.
+#
+--- a/kexts/XeGfxDisplay/src/XeGfxDisplay.h
++++ b/kexts/XeGfxDisplay/src/XeGfxDisplay.h
+@@ -611,6 +611,26 @@
+     bool fBootInDT     = false;   /* firmware raster taken over as mode 0?  */
+     bool fDisableMode  = false;   /* -xedispdt=0                            */
+     bool fNoAccel      = false;   /* -xedispaccel=0                         */
++};
++
++/*
++ * The class IOKit actually instantiates (Info.plist IOClass).
++ *
++ * CoreDisplay picks the GPU vendor of every IOFramebuffer from its C++ class
++ * name (GetGPUVendorForFramebufferService: "Intel" -> IG, "AMD", "NVDA",
++ * "AppleParavirt"; anything else is an unknown vendor).  With only unknown
++ * vendors UseIOPresentment() silently clears useIOP, the display falls back
++ * to the legacy CGXDisplayDevice surface and CompositorSW, which asserts in
++ * CA::OGL::Context::push_surface on the first flattened layer.  The class
++ * name must therefore contain "Intel".
++ *
++ * Not "XeGfxIntelFramebuffer": that name belongs to the XeGfxIntelFB
++ * placeholder, and XeGfxAccel checks metaCast("XeGfxIntelFramebuffer") first.
++ * All behaviour stays in XeGfxFramebuffer; serviceMatching / metaCast /
++ * ioreg -c lookups of "XeGfxFramebuffer" keep matching this subclass.
++ */
++class XeGfxIntelKMSFramebuffer : public XeGfxFramebuffer
++{    OSDeclareDefaultStructors(XeGfxIntelKMSFramebuffer)
+ };
+ 
+ #endif /* _XEGFXDISPLAY_H_ */
+--- a/kexts/XeGfxDisplay/src/XeGfxDisplay.cpp
++++ b/kexts/XeGfxDisplay/src/XeGfxDisplay.cpp
+@@ -54,6 +54,7 @@
+     IOLog(XEGFX_DISPLAY_LOG_PREFIX fmt "\n", ##__VA_ARGS__)
+ 
+ OSDefineMetaClassAndStructors(XeGfxFramebuffer, IOFramebuffer)
++OSDefineMetaClassAndStructors(XeGfxIntelKMSFramebuffer, XeGfxFramebuffer)
+ 
+ /* ======================================================================= */
+ /* boot-arg / NVRAM helpers                                                */
+--- a/kexts/XeGfxDisplay/Info.plist
++++ b/kexts/XeGfxDisplay/Info.plist
+@@ -42,7 +42,8 @@
+ 		<key>XeGfxFramebuffer</key>
+ 		<dict>
+ 			<key>CFBundleIdentifier</key><string>org.watchthelight.XeGfxDisplay</string>
+-			<key>IOClass</key><string>XeGfxFramebuffer</string>
++			<!-- Must contain "Intel": CoreDisplay keys IOPresentment off the class name (see XeGfxDisplay.h). -->
++			<key>IOClass</key><string>XeGfxIntelKMSFramebuffer</string>
+ 			<key>IOProviderClass</key><string>XeGfxDisplayNub</string>
+ 			<key>IOProbeScore</key><integer>10000</integer>
+ 		</dict>

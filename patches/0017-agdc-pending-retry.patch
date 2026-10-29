@@ -1,0 +1,95 @@
+# 0017 XeGfxAGDC: keep retrying when core writes debug.xegfx_agdc=1 before the framebuffer exists
+#
+# Base:  kexts/NVRMAGDC/nvrm-agdc.cpp as built into XeGfxAGDC 43dfb951 (0004 + 0013)
+# Files: kexts/NVRMAGDC/nvrm-agdc.cpp (modified)
+# Apply: patch -p1 < patches/0017-agdc-pending-retry.patch
+#
+# Problem: core writes debug.xegfx_agdc=1 right after boot stage 7.  nvdaAgdcAutoNoteManual() treated that as a
+# userspace request and switched the automatic poll off.  When XeGfxFramebuffer was published after the write
+# (4.4 s late in the ninth trial) the single worker run found no framebuffer, AGDC stayed down, IOPresentment
+# could not build its device map and WindowServer fell back to the legacy surface.
+# Fix: the write moves the poll into kAgdcAutoManualRetry instead of cancelling it; the poll supervises it like
+# the in-kernel arm (retry every 500 ms on "no framebuffer yet", stop on success or a hard failure, 900 s
+# budget).  gAgdcCall is allocated before the poll is told, and the retry branch checks it.
+#
+--- a/kexts/NVRMAGDC/nvrm-agdc.cpp
++++ b/kexts/NVRMAGDC/nvrm-agdc.cpp
+@@ -271,7 +271,7 @@
+ // Automatic arming state machine: idle, waiting for the request, armed (applied; the poll now only watches the
+ // worker come up and retries the no-framebuffer-yet failure), timeout (userspace may still do the old writes),
+ // manual (userspace wrote agdc=1 itself; the poll is cancelled).
+-enum { kAgdcAutoIdle, kAgdcAutoWaitReq, kAgdcAutoArmed, kAgdcAutoTimeout, kAgdcAutoManual };
++enum { kAgdcAutoIdle, kAgdcAutoWaitReq, kAgdcAutoArmed, kAgdcAutoTimeout, kAgdcAutoManual, kAgdcAutoManualRetry };
+ static int    gAgdcAutoState = kAgdcAutoIdle;
+ static int    gAgdcAutoEnabled = 0;
+ static thread_call_t gAgdcAutoCall = nullptr;
+@@ -354,6 +354,7 @@
+     case kAgdcAutoArmed:   autoTxt = "armed: XeGfxAccelAgdcRequest applied in-kernel"; break;
+     case kAgdcAutoTimeout: autoTxt = "timeout: no XeGfxAccelAgdcRequest"; break;
+     case kAgdcAutoManual:  autoTxt = "manual: debug.xegfx_agdc=1 by userspace"; break;
++    case kAgdcAutoManualRetry: autoTxt = "manual: debug.xegfx_agdc=1 by userspace, retrying until a framebuffer is eligible"; break;
+     default: break;
+     }
+     s->setProperty("xegfx-agdc-state", nvdaAgdcStateText());
+@@ -439,7 +440,9 @@
+             if (gAgdcAutoState == kAgdcAutoWaitReq) nvdaAgdcAutoApply(pci);
+             pci->release();
+         }
+-        if (gAgdcAutoState == kAgdcAutoArmed && gAgdcState == 1) {
++        // a userspace write (kAgdcAutoManualRetry) is supervised exactly like the in-kernel arm
++        bool armed = gAgdcAutoState == kAgdcAutoArmed || gAgdcAutoState == kAgdcAutoManualRetry;
++        if (armed && gAgdcState == 1) {
+             gAgdcAutoEnabled = 0;
+             snprintf(gAgdcAutoWhy, sizeof gAgdcAutoWhy, "done: AGDC up on %u framebuffer slot(s), K5 on", gAgdcNFB);
+             FBLOG("AGDC auto: done — AGDC is UP (%u framebuffer slot(s)); the userspace two-sysctl step is no longer needed", gAgdcNFB);
+@@ -450,13 +453,13 @@
+                      nvdaAgdcStateText(), (long long)gAgdcAutoPolls);
+             FBLOG("AGDC auto: %s", gAgdcAutoWhy);
+             nvdaAgdcPublish();
+-        } else if (gAgdcAutoState == kAgdcAutoArmed && gAgdcState <= -2) {
++        } else if (armed && gAgdcState <= -2) {
+             // a hard bring-up failure will not fix itself by polling: report it once and stop the poll
+             gAgdcAutoEnabled = 0; gAgdcAutoState = kAgdcAutoTimeout;
+             snprintf(gAgdcAutoWhy, sizeof gAgdcAutoWhy, "bring-up failed: %s; no retry (userspace can still write debug.xegfx_agdc=1/debug.xegfx_agdc_k5=1)", gAgdcFailText);
+             FBLOG("AGDC auto: %s", gAgdcAutoWhy);
+             nvdaAgdcPublish();
+-        } else if (gAgdcAutoState == kAgdcAutoArmed && (gAgdcState == 0 || gAgdcState == -1) && !gAgdcBusy && now - gAgdcAutoLastArm >= per) {
++        } else if (armed && gAgdcCall && (gAgdcState == 0 || gAgdcState == -1) && !gAgdcBusy && now - gAgdcAutoLastArm >= per) {
+             // no framebuffer candidate yet (the request can beat the adapter's registration): retry the worker
+             gAgdcAutoLastArm = now;
+             thread_call_enter(gAgdcCall);
+@@ -509,13 +512,16 @@
+     if (calm < 5) FBLOG("stop: the AGDC auto poll is STILL running after 4 s — leaving its thread call allocated rather than freeing it under it");
+     else { thread_call_free(gAgdcAutoCall); gAgdcAutoCall = nullptr; }
+ }
+-// Userspace wrote debug.xegfx_agdc itself: the old path wins and the poll stops (no target grab without userspace).
++// Userspace wrote debug.xegfx_agdc itself.  The write can come before the adapter framebuffer exists (core writes it
++// right after stage 7, the framebuffer is published on its own schedule), so the poll keeps supervising it: a
++// "no framebuffer yet" worker result is retried every 500 ms within the same 900 s budget, a hard failure still stops.
+ static void nvdaAgdcAutoNoteManual(void)
+ {
+     if (gAgdcAutoState == kAgdcAutoWaitReq || gAgdcAutoState == kAgdcAutoArmed) {
+-        gAgdcAutoState = kAgdcAutoManual; gAgdcAutoEnabled = 0;
+-        snprintf(gAgdcAutoWhy, sizeof gAgdcAutoWhy, "debug.xegfx_agdc=1 written by userspace; automatic arming cancelled");
+-        FBLOG("AGDC auto: cancelled — userspace wrote debug.xegfx_agdc=1");
++        uint64_t now = 0; clock_get_uptime(&now);
++        gAgdcAutoState = kAgdcAutoManualRetry; gAgdcAutoLastArm = now;
++        snprintf(gAgdcAutoWhy, sizeof gAgdcAutoWhy, "debug.xegfx_agdc=1 written by userspace; retrying until a framebuffer is eligible");
++        FBLOG("AGDC auto: userspace wrote debug.xegfx_agdc=1 — the poll keeps retrying the worker until a framebuffer is eligible");
+         nvdaAgdcPublish();
+     }
+ }
+@@ -679,11 +685,11 @@
+     if (v == 0) return EPERM;
+ #endif
+     gAgdcWant = v;
++    if (!gAgdcCall) gAgdcCall = thread_call_allocate(nvdaAgdcWork, nullptr);
++    if (!gAgdcCall) return ENOMEM;
+ #ifdef NMX_XEGFX
+     nvdaAgdcAutoNoteManual();
+ #endif
+-    if (!gAgdcCall) gAgdcCall = thread_call_allocate(nvdaAgdcWork, nullptr);
+-    if (!gAgdcCall) return ENOMEM;
+     thread_call_enter(gAgdcCall);
+     nvdaAgdcPublish();
+     return 0;
