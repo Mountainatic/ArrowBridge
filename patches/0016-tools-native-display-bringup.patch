@@ -2222,7 +2222,7 @@
 +say "raw outputs: $OUT"
 --- /dev/null
 +++ b/tools/m3db-arm.applescript
-@@ -0,0 +1,2 @@
+@@ -0,0 +1,3 @@
 +-- M3d-b 布置：安装 bootguard + 写闸门（不重启）。点运行（▶）后输入管理员密码
 +set scriptDir to do shell script "/usr/bin/dirname " & quoted form of (POSIX path of (path to me))
 +do shell script "/bin/bash " & quoted form of (scriptDir & "/m3db-arm.sh") & " --apply 2>&1; echo EXIT=$?" with administrator privileges
@@ -2498,7 +2498,7 @@
 +        print('M3DB_FAILED: '+str(exc), file=sys.stderr); sys.exit(1)
 --- /dev/null
 +++ b/tools/m3db-disarm.applescript
-@@ -0,0 +1,2 @@
+@@ -0,0 +1,3 @@
 +-- 撤销 M3d-b：闸门回安全态并停用 bootguard（不重启）
 +set scriptDir to do shell script "/usr/bin/dirname " & quoted form of (POSIX path of (path to me))
 +do shell script "/bin/bash " & quoted form of (scriptDir & "/m3db-disarm.sh") & " 2>&1; echo EXIT=$?" with administrator privileges
@@ -2581,7 +2581,7 @@
 +        sys.exit(1)
 --- /dev/null
 +++ b/tools/m3db-preflight.applescript
-@@ -0,0 +1,2 @@
+@@ -0,0 +1,3 @@
 +-- M3d-b 只读体检：点运行（▶）后会弹出 macOS 管理员密码窗口
 +set scriptDir to do shell script "/usr/bin/dirname " & quoted form of (POSIX path of (path to me))
 +do shell script "/bin/bash " & quoted form of (scriptDir & "/m3db-preflight.sh") & " 2>&1; echo EXIT=$?" with administrator privileges
