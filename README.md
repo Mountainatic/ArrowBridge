@@ -8,59 +8,45 @@
 
 ## 启动方式与工作机制
 
-当前主线已经不再依赖系统完整进入桌面后手动加载 core、加速器和 framebuffer。OpenCore 与固件先保留已经点亮的内屏，XeGfx 随启动过程进入 boot-arm 路径，在内核线程中完成 GPU 与显示前端初始化；随后 framebuffer、加速器、AGDC 与 WindowServer 按各自的 IOKit 依赖继续接上。手动 bring-up 仍保留作为回归和故障隔离手段。
+启动阶段由固件维持内屏扫描，XeGfx 通过 boot-arm 在内核线程中推进 GPU 与显示初始化。VBT、EDID、DPCD、framebuffer、加速器与 AGDC 按 IOKit 依赖逐层建立，WindowServer 随后接入 XeMTL、ANV 与显示提交链。
 
-1. **固件保留已经点亮的内屏**
+1. **固件维持内屏扫描**
 
-   使用 [YaoShi16-Ultra-OpenCore-efi](https://github.com/Mountainatic/YaoShi16-Ultra-OpenCore-efi) 启动 macOS Tahoe。进入内核阶段时先不改动固件留下的显示管线，当前 raster 与 scanout 继续维持画面，为后续分阶段接管提供稳定起点。
+   使用 [YaoShi16-Ultra-OpenCore-efi](https://github.com/Mountainatic/YaoShi16-Ultra-OpenCore-efi) 启动 macOS Tahoe。固件留下当前 raster 与 scanout，内屏在 XeGfx 初始化期间保持显示。
 
-2. **XeGfx 在启动阶段自动拉起核显**
+2. **XeGfx 在启动阶段完成 GPU 初始化**
 
-   使用 [watchthelight-labs/NvGfx 的 xe 分支](https://github.com/watchthelight-labs/NvGfx/tree/xe) 中的 `gpu/xegfx`，其 XNU 适配层来自 [watchthelight-labs/XeGfx](https://github.com/watchthelight-labs/XeGfx)。boot-arm 被触发后，XeGfx 不再等待登录后手动 `kmutil load`，而是在自己的内核线程中依次推进 stage 1–7，完成 PCI、内存、IRQ、GuC 与 render/copy/compute engine 的初始化。
+   使用 [watchthelight-labs/NvGfx 的 xe 分支](https://github.com/watchthelight-labs/NvGfx/tree/xe) 中的 `gpu/xegfx`，XNU 适配层来自 [watchthelight-labs/XeGfx](https://github.com/watchthelight-labs/XeGfx)。boot-arm 触发后，XeGfx 在内核线程中依次推进 stage 1–7，完成 PCI、内存、IRQ、GuC 与 render/copy/compute engine 初始化。
 
-   当前 core 基线为 [NvGfx xe 提交 5a19a73f](https://github.com/watchthelight-labs/NvGfx/commit/5a19a73f36249efb99c44c3f9cb34603ef0c0eb8)，对应 XeGfx 0.0.44。启动路径带有独立的阶段状态与失败记录，某一级失败时停止继续接管，而不是让无人值守启动卡死在中间状态。
+   当前 core 基线为 [NvGfx xe 提交 5a19a73f](https://github.com/watchthelight-labs/NvGfx/commit/5a19a73f36249efb99c44c3f9cb34603ef0c0eb8)，对应 XeGfx 0.0.44。
 
-3. **i915 解析 VBT，并发布内建显示信息**
+3. **i915 解析 VBT 并建立内建显示信息**
 
-   显示初始化进入 stage 4 后，i915 读取固件 ACPI OpRegion 与 VBT，保留内建 eDP child、面板 timing 与 connector 信息。XeGfx 随后发布 `XeGfxDisplayNub`，把 VBT、child 记录、只读 KMS KAPI 与 scanout 接口交给后面的 framebuffer adapter。
+   stage 4 读取 ACPI OpRegion 与 VBT，取得内建 eDP child、面板 timing 与 connector 信息。XeGfx 发布 `XeGfxDisplayNub`，并提供 VBT、child 记录、KMS KAPI 与 scanout 接口。
 
-   这一过程发生在 WindowServer 建立桌面之前，不再依赖旧的 XeGfxIntelFB 在登录后读取一遍活动管线才能得到显示信息。
+4. **AUX 读取 EDID 与 DPCD**
 
-4. **通过 AUX 自动读取面板 EDID 与 DPCD**
+   core 根据 VBT 中的内建 eDP child 定位 AUX 通道，读取 DPCD，并通过 I2C-over-AUX 获取 EDID。当前实机读取到 384 B EDID，面板为 BOE `0x0D55`；DPCD 报告 1.4、HBR3 x4、8b/10b、DSC 1.2，并支持 AUX 背光。
 
-   在发布 display nub 前，core 根据 VBT 中的内建 eDP child 找到 AUX 通道，直接读取 DPCD，并通过 I2C-over-AUX 获取 EDID。当前实机可以读到 384 B EDID，面板为 BOE `0x0D55`；DPCD 报告 1.4、HBR3 x4、8b/10b、DSC 1.2，并支持 AUX 背光。
+   EDID 与 DPCD 以 `xegfx-edid` 和 `xegfx-dpcd` 随 display nub 发布，XeGfxDisplay 按 IOGraphicsFamily 的 DDC 接口提供给 macOS。
 
-   EDID 与 DPCD 作为 `xegfx-edid`、`xegfx-dpcd` 随 display nub 发布，XeGfxDisplay 再按 IOGraphicsFamily 的 DDC 语义交给 macOS，因此系统可以在正常显示枚举阶段识别内建面板，而不是先出现 Unknown Display 再靠后续脚本修正。
+5. **K1 读取 i915 eDP 管线状态**
 
-5. **K1 让 i915 只读恢复固件留下的 eDP 状态**
+   `xegfx-disp-kms=1` 启用 K1 后，i915 建立内建 eDP encoder/connector，读取 fixed modes、CRTC、CDCLK 与当前活动管线状态，并持有对应的显示电源引用。当前阶段保持固件 raster，供后续 modeset 继续接管。
 
-   当 `xegfx-disp-kms=1` 打开 K1 时，i915 不再以 `no_display` 方式完全避开显示子系统，而是建立内建 eDP encoder/connector、读取 fixed modes、CRTC、CDCLK 与当前活动管线状态，并持有对应的显示电源引用。
+6. **XeGfxDisplay 建立 framebuffer 与 scanout**
 
-   K1 只做 readout：不 sanitize 现有管线，不做 initial plane config，不 initial commit，也不启动 hotplug、fbdev 或 OpRegion 注册。固件当前正在扫描的模式保持原样。这个阶段用于先证明 i915 能正确理解正在工作的显示硬件，再进入后面的 modeset。
+   `XeGfxDisplay.kext` 匹配 `XeGfxDisplayNub`，读取 KMS KAPI、面板模式与 EDID，建立 `XeGfxIntelKMSFramebuffer`。framebuffer 通过 KAPI 分配 scanout，并把 scanout 信息交给 XeGfxAccel。CoreDisplay 通过 Intel framebuffer 类名识别核显显示设备，并启用 IOPresentment。
 
-6. **XeGfxDisplay 建立 macOS framebuffer 与 scanout**
+7. **XeGfxAccel 与 AGDC 建立显示事务**
 
-   `XeGfxDisplay.kext` 匹配 `XeGfxDisplayNub`，读取 core 提供的 KMS KAPI、面板模式与 EDID，建立 `XeGfxIntelKMSFramebuffer`。framebuffer 通过 KAPI 分配自己的 scanout，并把 scanout 信息交给 XeGfxAccel；旧 XeGfxIntelFB 仍作为回退路径保留，boot guard 决定当前启动由哪一条 framebuffer 路径接管内屏。
+   XeGfxAccel 等待 framebuffer 完成启动与 scanout 准备，将内屏注册到 display machine，导入 scanout，并发布 present 接口与 AGDC 请求。XeGfxAGDC 随后完成 framebuffer 映射与 K5 link-config，建立 framebuffer、head 与 display pipe 的对应关系。
 
-   framebuffer 的 Intel 类名同时让 CoreDisplay 正确识别 GPU vendor，使后面的 IOPresentment 保持启用。
+8. **WindowServer 进入 XeMTL、ANV 与显示提交链**
 
-7. **XeGfxAccel 与 AGDC 自动接上显示事务**
+   XeGfxAccel 向系统暴露 XeMTL Metal 插件。XeMTL 基于 [NvGfx xe 分支](https://github.com/watchthelight-labs/NvGfx/tree/xe) 0.0.35 时期的 plugin 改编，Metal shader 经 metal2vulkan 进入 [Mesa](https://gitlab.freedesktop.org/mesa/mesa) ANV，再通过 i915 ioctl 提交到 XeGfx。
 
-   XeGfxAccel 在启动时等待 framebuffer 完成 `start()` 和 scanout 准备，再把内屏注册到 display machine。对于 XeGfxDisplay 路径，加速器直接导入 adapter 分配的 scanout，并发布 present 接口与 AGDC 请求。
-
-   XeGfxAGDC 监听这一请求，在 framebuffer 尚未出现时持续重试；目标可用后完成 AGDC 与 K5 link-config，使 framebuffer、head 与 display pipe 建立对应关系。这里已经不再需要登录后手工写两组 sysctl 才能把显示事务接起来。
-
-8. **WindowServer 通过 XeMTL 与 ANV 使用 Intel GPU**
-
-   当 macOS 建立图形会话时，XeGfxAccel 向系统暴露 XeMTL Metal 插件。XeMTL 由 [NvGfx xe 分支](https://github.com/watchthelight-labs/NvGfx/tree/xe) 0.0.35 时期的 plugin 改编而来，Metal shader 经 metal2vulkan 进入 [Mesa](https://gitlab.freedesktop.org/mesa/mesa) ANV，再通过 i915 ioctl 提交到 XeGfx。
-
-   WindowServer 的 Metal 合成结果由此进入 Intel framebuffer 对应的 IOPresentment/display-pipe 通路，而不是启动完成后再靠一次人工 bring-up 才获得 Metal 桌面。
-
-9. **GGTT 零拷贝与 K9 完成最终 present**
-
-   合成 surface 的物理页可以直接映射到 XeGfx core 预留的 GGTT 槽，display-pipe 因而不再需要 CPU 每帧复制整张 framebuffer。三个 GGTT 槽按帧轮转，CPU copy 仍保留为故障回退路径。
-
-   K9 deferred flip 继续负责 GPU 写入与扫描切换之间的排序：WindowServer 提交后可以立即返回，XeGfxAccel 的 defer worker 等待 i915 engine 空闲后再 arm 新 surface，最后由 vblank 锁存。当前已经验证的 2560x1600@60Hz 路径可维持约 60fps；接下来的显示工作重点是 K2 同模式 modeset，再进入 HBR3 + DSC 与 1920x1200@240Hz HiDPI。
+   WindowServer 的合成结果进入 IOPresentment/display-pipe 通路。合成 surface 映射到 XeGfx core 预留的 GGTT 槽，K9 deferred flip 在 GPU 完成后 arm 新 surface，并由 vblank 锁存到扫描面。
 
 ## 推进过程中解决的问题
 
