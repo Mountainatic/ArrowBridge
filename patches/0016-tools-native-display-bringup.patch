@@ -7,7 +7,7 @@
 # The scripts behind 0011-0015, in stage order: m0/m1a/m1b/m2c probes and bring-up, m3c baseline and gates,
 # m3d install/verify and preflight, the m3db arm/disarm/health/control set, m4a1 boot-arm and the m4a2 boot guard
 # (launchd plists included), the Metal contract probe, and build-xegfxdisplay.sh.  Absolute paths are replaced:
-# shell uses ${XE_CODEX_ROOT:-$HOME/Documents/Codex}, Python XE_CODEX_ROOT or ~/Documents/Codex, AppleScript the
+# repository-local tools resolve from their own location; external source/build trees use explicit XEGFX_* environment variables; AppleScript wrappers resolve sibling scripts from path to me
 # home folder.  m3db-preflight.applescript is stored as UTF-8 (was UTF-16).
 #
 --- /dev/null
@@ -207,9 +207,9 @@
 +set -euo pipefail
 +
 +EXPECT_SHA_PREFIX="${1:-2b9f6b38}"
-+SRC="${XE_CODEX_ROOT:-$HOME/Documents/Codex}/2026-10-23/d/outputs/Intel-iGPU-275HX-20261023/src/NvGfx/gpu/xegfx/out/XeGfx.kext"
-+INSTALLER="${XE_CODEX_ROOT:-$HOME/Documents/Codex}/2026-10-24/ni/install_core_044.py"
-+PROBE_SCRIPT="${XE_CODEX_ROOT:-$HOME/Documents/Codex}/2026-10-27-native-display/tools/m0-probe.sh"
++SRC="${XEGFX_CORE_KEXT:?set XEGFX_CORE_KEXT to the XeGfx.kext build artifact}"
++INSTALLER="${XEGFX_CORE_INSTALLER:?set XEGFX_CORE_INSTALLER to install_core_044.py}"
++PROBE_SCRIPT="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/m0-probe.sh"
 +
 +[ "$(id -u)" = "0" ] || { echo "must run as root"; exit 1; }
 +[ -d "$SRC" ] || { echo "missing build artifact: $SRC"; exit 1; }
@@ -244,9 +244,9 @@
 +set -euo pipefail
 +
 +EXPECT_SHA_PREFIX="${1:?usage: install-m1a.sh <sha256-prefix>}"
-+SRC="${XE_CODEX_ROOT:-$HOME/Documents/Codex}/2026-10-23/d/outputs/Intel-iGPU-275HX-20261023/src/NvGfx/gpu/xegfx/out/XeGfx.kext"
-+INSTALLER="${XE_CODEX_ROOT:-$HOME/Documents/Codex}/2026-10-24/ni/install_core_044.py"
-+BRINGUP="${XE_CODEX_ROOT:-$HOME/Documents/Codex}/2026-10-27-native-display/tools/m1a-bringup.sh"
++SRC="${XEGFX_CORE_KEXT:?set XEGFX_CORE_KEXT to the XeGfx.kext build artifact}"
++INSTALLER="${XEGFX_CORE_INSTALLER:?set XEGFX_CORE_INSTALLER to install_core_044.py}"
++BRINGUP="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/m1a-bringup.sh"
 +
 +[ "$(id -u)" = "0" ] || { echo "must run as root"; exit 1; }
 +[ -d "$SRC" ] || { echo "missing build artifact: $SRC"; exit 1; }
@@ -282,9 +282,9 @@
 +set -euo pipefail
 +
 +EXPECT_SHA_PREFIX="${1:?usage: install-m1b.sh <sha256-prefix>}"
-+SRC="${XE_CODEX_ROOT:-$HOME/Documents/Codex}/2026-10-23/d/outputs/Intel-iGPU-275HX-20261023/src/NvGfx/gpu/xegfx/out/XeGfx.kext"
-+INSTALLER="${XE_CODEX_ROOT:-$HOME/Documents/Codex}/2026-10-24/ni/install_core_044.py"
-+BRINGUP="${XE_CODEX_ROOT:-$HOME/Documents/Codex}/2026-10-27-native-display/tools/m1b-bringup.sh"
++SRC="${XEGFX_CORE_KEXT:?set XEGFX_CORE_KEXT to the XeGfx.kext build artifact}"
++INSTALLER="${XEGFX_CORE_INSTALLER:?set XEGFX_CORE_INSTALLER to install_core_044.py}"
++BRINGUP="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/m1b-bringup.sh"
 +
 +[ "$(id -u)" = "0" ] || { echo "must run as root"; exit 1; }
 +[ -d "$SRC" ] || { echo "missing build artifact: $SRC"; exit 1; }
@@ -325,9 +325,9 @@
 +"""
 +import datetime, json, os, pathlib, plistlib, re, shutil, subprocess, sys
 +
-+N = pathlib.Path(os.environ.get("XE_CODEX_ROOT", os.path.expanduser("~/Documents/Codex")), "2026-10-23/d/outputs/Intel-iGPU-275HX-20261023/src/NvGfx")
++N = pathlib.Path(os.environ["XEGFX_NVGFX_ROOT"]).expanduser().resolve()
 +SRC_CORE = N / "gpu/xegfx/out/XeGfx.kext"
-+SRC_DISP = pathlib.Path(os.environ.get("XE_CODEX_ROOT", os.path.expanduser("~/Documents/Codex")), "2026-10-27-native-display/nvrmfb-adapter/kexts/XeGfxDisplay/out/XeGfxDisplay.kext")
++SRC_DISP = (pathlib.Path(os.environ["XEGFX_DISPLAY_KEXT"]).expanduser().resolve() if os.environ.get("XEGFX_DISPLAY_KEXT") else pathlib.Path(__file__).resolve().parent.parent / "nvrmfb-adapter/kexts/XeGfxDisplay/out/XeGfxDisplay.kext")
 +DEST_CORE = pathlib.Path("/Library/Extensions/XeGfx.kext")
 +DEST_DISP = pathlib.Path("/Library/Extensions/XeGfxDisplay.kext")
 +KC = pathlib.Path("/Library/KernelCollections/AuxiliaryKernelExtensions.kc")
@@ -526,8 +526,8 @@
 +import sys
 +from xegfx_metal_contract import validate as validate_metal
 +
-+N = pathlib.Path(os.environ.get("XE_CODEX_ROOT", os.path.expanduser("~/Documents/Codex")), "2026-10-23/d/outputs/Intel-iGPU-275HX-20261023/src/NvGfx")
-+ND = pathlib.Path(os.environ.get("XE_CODEX_ROOT", os.path.expanduser("~/Documents/Codex")), "2026-10-27-native-display")
++N = pathlib.Path(os.environ["XEGFX_NVGFX_ROOT"]).expanduser().resolve()
++ND = pathlib.Path(__file__).resolve().parent.parent
 +SRC_CORE = N / "gpu/xegfx/out/XeGfx.kext"
 +SRC_DISP = ND / "nvrmfb-adapter/kexts/XeGfxDisplay/out/XeGfxDisplay.kext"
 +DEST_CORE = pathlib.Path("/Library/Extensions/XeGfx.kext")
@@ -819,9 +819,9 @@
 +"""
 +import datetime, json, os, pathlib, plistlib, re, shutil, subprocess, sys
 +
-+N = pathlib.Path(os.environ.get("XE_CODEX_ROOT", os.path.expanduser("~/Documents/Codex")), "2026-10-23/d/outputs/Intel-iGPU-275HX-20261023/src/NvGfx")
++N = pathlib.Path(os.environ["XEGFX_NVGFX_ROOT"]).expanduser().resolve()
 +SRC_CORE = N / "gpu/xegfx/out/XeGfx.kext"
-+SRC_DISP = pathlib.Path(os.environ.get("XE_CODEX_ROOT", os.path.expanduser("~/Documents/Codex")), "2026-10-27-native-display/nvrmfb-adapter/kexts/XeGfxDisplay/out/XeGfxDisplay.kext")
++SRC_DISP = (pathlib.Path(os.environ["XEGFX_DISPLAY_KEXT"]).expanduser().resolve() if os.environ.get("XEGFX_DISPLAY_KEXT") else pathlib.Path(__file__).resolve().parent.parent / "nvrmfb-adapter/kexts/XeGfxDisplay/out/XeGfxDisplay.kext")
 +DEST_CORE = pathlib.Path("/Library/Extensions/XeGfx.kext")
 +DEST_DISP = pathlib.Path("/Library/Extensions/XeGfxDisplay.kext")
 +KC = pathlib.Path("/Library/KernelCollections/AuxiliaryKernelExtensions.kc")
@@ -1087,8 +1087,8 @@
 +# log in again); everything is captured under /Library/XeGfxTrial/m1a-<stamp>/.
 +
 +set -u
-+ROOT=${XE_CODEX_ROOT:-$HOME/Documents/Codex}/2026-10-23/d/outputs/Intel-iGPU-275HX-20261023
-+NI=${XE_CODEX_ROOT:-$HOME/Documents/Codex}/2026-10-24/ni
++ROOT=${XEGFX_PROJECT_ROOT:?set XEGFX_PROJECT_ROOT to the external project/build tree}
++NI=${XEGFX_HELPER_DIR:?set XEGFX_HELPER_DIR to the helper directory}
 +STAMP=$(date '+%Y%m%d-%H%M%S')
 +TSTART=$(date '+%Y-%m-%d %H:%M:%S')
 +OUT="/Library/XeGfxTrial/m1a-$STAMP"
@@ -1264,8 +1264,8 @@
 +# log in again); everything is captured under /Library/XeGfxTrial/m1b-<stamp>/.
 +
 +set -u
-+ROOT=${XE_CODEX_ROOT:-$HOME/Documents/Codex}/2026-10-23/d/outputs/Intel-iGPU-275HX-20261023
-+NI=${XE_CODEX_ROOT:-$HOME/Documents/Codex}/2026-10-24/ni
++ROOT=${XEGFX_PROJECT_ROOT:?set XEGFX_PROJECT_ROOT to the external project/build tree}
++NI=${XEGFX_HELPER_DIR:?set XEGFX_HELPER_DIR to the helper directory}
 +STAMP=$(date '+%Y%m%d-%H%M%S')
 +TSTART=$(date '+%Y-%m-%d %H:%M:%S')
 +OUT="/Library/XeGfxTrial/m1b-$STAMP"
@@ -1450,8 +1450,8 @@
 +esac
 +# Fail before loading or arming anything if the installed matching personality is wrong.
 +/usr/bin/python3 "$HERE/xegfx-ws-preflight.py" --disk-only || exit 2
-+ROOT=${XE_CODEX_ROOT:-$HOME/Documents/Codex}/2026-10-23/d/outputs/Intel-iGPU-275HX-20261023
-+NI=${XE_CODEX_ROOT:-$HOME/Documents/Codex}/2026-10-24/ni
++ROOT=${XEGFX_PROJECT_ROOT:?set XEGFX_PROJECT_ROOT to the external project/build tree}
++NI=${XEGFX_HELPER_DIR:?set XEGFX_HELPER_DIR to the helper directory}
 +STAMP=$(date '+%Y%m%d-%H%M%S')
 +TSTART=$(date '+%Y-%m-%d %H:%M:%S')
 +OUT="/Library/XeGfxTrial/m2c-$STAMP"
@@ -1766,7 +1766,7 @@
 @@ -0,0 +1,20 @@
 +#!/bin/bash
 +# Read-only baseline capture for M3c S1/S2 (no root needed for most of it).
-+P=${XE_CODEX_ROOT:-$HOME/Documents/Codex}/2026-10-27-native-display
++P=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 +D=$P/data/m3c-baseline-$(date +%Y%m%d-%H%M%S); mkdir -p "$D"
 +echo "out=$D"
 +date > "$D/date.txt"; sysctl -n kern.boottime >> "$D/date.txt"; sysctl -n kern.bootsessionuuid >> "$D/date.txt"
@@ -1870,8 +1870,8 @@
 +sys.path.insert(0, str(tools))
 +from xegfx_metal_contract import configure as configure_metal, validate as validate_metal
 +project = tools.parent
-+build = Path(os.environ.get("XE_CODEX_ROOT", os.path.expanduser("~/Documents/Codex")), '2026-10-25-xegfx-build-0044')
-+core = Path(os.environ.get("XE_CODEX_ROOT", os.path.expanduser("~/Documents/Codex")), '2026-10-23/d/outputs/Intel-iGPU-275HX-20261023/src/NvGfx/gpu/xegfx/out/XeGfx.kext')
++build = Path(os.environ["XEGFX_BUILD_ROOT"]).expanduser().resolve()
++core = Path(os.environ["XEGFX_CORE_KEXT"]).expanduser().resolve()
 +names = dict(core='XeGfx', adapter='XeGfxDisplay', accel='XeGfxAccel', agdc='XeGfxAGDC')
 +defaults = dict(core=core, adapter=project/'nvrmfb-adapter/kexts/XeGfxDisplay/out/XeGfxDisplay.kext',
 +                accel=build/'XeGfxAccel/26/XeGfxAccel.kext', agdc=build/'XeGfxAGDC/XeGfxAGDC.kext')
@@ -2150,7 +2150,7 @@
 +# 用法：./tools/m3d-verify.sh        （无需 root）
 +# 输出：data/m3d-verify-<stamp>/ 下的文件 + 终端摘要
 +set -u
-+ND=${XE_CODEX_ROOT:-$HOME/Documents/Codex}/2026-10-27-native-display
++ND=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 +STAMP=$(date '+%Y%m%d-%H%M%S')
 +OUT="$ND/data/m3d-verify-$STAMP"
 +mkdir -p "$OUT"
@@ -2224,7 +2224,8 @@
 +++ b/tools/m3db-arm.applescript
 @@ -0,0 +1,2 @@
 +-- M3d-b 布置：安装 bootguard + 写闸门（不重启）。点运行（▶）后输入管理员密码
-+do shell script "bash " & quoted form of ((POSIX path of (path to home folder)) & "Documents/Codex/2026-10-27-native-display/tools/m3db-arm.sh") & " --apply 2>&1; echo EXIT=$?" with administrator privileges
++set scriptDir to do shell script "/usr/bin/dirname " & quoted form of (POSIX path of (path to me))
++do shell script "/bin/bash " & quoted form of (scriptDir & "/m3db-arm.sh") & " --apply 2>&1; echo EXIT=$?" with administrator privileges
 --- /dev/null
 +++ b/tools/m3db-arm.sh
 @@ -0,0 +1,5 @@
@@ -2499,7 +2500,8 @@
 +++ b/tools/m3db-disarm.applescript
 @@ -0,0 +1,2 @@
 +-- 撤销 M3d-b：闸门回安全态并停用 bootguard（不重启）
-+do shell script "bash " & quoted form of ((POSIX path of (path to home folder)) & "Documents/Codex/2026-10-27-native-display/tools/m3db-disarm.sh") & " 2>&1; echo EXIT=$?" with administrator privileges
++set scriptDir to do shell script "/usr/bin/dirname " & quoted form of (POSIX path of (path to me))
++do shell script "/bin/bash " & quoted form of (scriptDir & "/m3db-disarm.sh") & " 2>&1; echo EXIT=$?" with administrator privileges
 --- /dev/null
 +++ b/tools/m3db-disarm.sh
 @@ -0,0 +1,5 @@
@@ -2581,7 +2583,8 @@
 +++ b/tools/m3db-preflight.applescript
 @@ -0,0 +1,2 @@
 +-- M3d-b 只读体检：点运行（▶）后会弹出 macOS 管理员密码窗口
-+do shell script "bash " & quoted form of ((POSIX path of (path to home folder)) & "Documents/Codex/2026-10-27-native-display/tools/m3db-preflight.sh") & " 2>&1; echo EXIT=$?" with administrator privileges
++set scriptDir to do shell script "/usr/bin/dirname " & quoted form of (POSIX path of (path to me))
++do shell script "/bin/bash " & quoted form of (scriptDir & "/m3db-preflight.sh") & " 2>&1; echo EXIT=$?" with administrator privileges
 --- /dev/null
 +++ b/tools/m3db-preflight.sh
 @@ -0,0 +1,208 @@
@@ -2862,7 +2865,7 @@
 +#!/bin/bash
 +# M3c S2 verification (read-only; run after bring-up).  usage: m3s2-verify.sh [outdir]
 +set -u
-+D=${1:-${XE_CODEX_ROOT:-$HOME/Documents/Codex}/2026-10-27-native-display/data/m3s2-verify-$(date +%Y%m%d-%H%M%S)}
++D=${1:-$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)/data/m3s2-verify-$(date +%Y%m%d-%H%M%S)}
 +mkdir -p "$D"
 +exec > >(tee -a "$D/report.txt") 2>&1
 +echo "== M3c S2 verification $(date) =="
@@ -3133,9 +3136,9 @@
 +# single WindowServer restart performed by the daemon.
 +set -u
 +
-+P=${XE_CODEX_ROOT:-$HOME/Documents/Codex}/2026-10-27-native-display
-+CORE_OUT=${XE_CODEX_ROOT:-$HOME/Documents/Codex}/2026-10-23/d/outputs/Intel-iGPU-275HX-20261023/src/NvGfx/gpu/xegfx/out/XeGfx.kext
-+ACCEL_OUT=${XE_CODEX_ROOT:-$HOME/Documents/Codex}/2026-10-25-xegfx-build-0044/XeGfxAccel/26/XeGfxAccel.kext
++P=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
++CORE_OUT=${XEGFX_CORE_KEXT:?set XEGFX_CORE_KEXT to the XeGfx.kext build artifact}
++ACCEL_OUT=${XEGFX_ACCEL_KEXT:?set XEGFX_ACCEL_KEXT to the XeGfxAccel.kext build artifact}
 +STAMP=$(date +%Y%m%d-%H%M%S)
 +BK=/Library/XeGfxTrial/m4a1-install-$STAMP
 +mkdir -p "$BK"
@@ -3225,7 +3228,7 @@
 +#!/bin/bash
 +# M4a-1 重启后一键验收（无需 root）。用法: bash tools/m4a1-verify.sh
 +set -u
-+P=${XE_CODEX_ROOT:-$HOME/Documents/Codex}/2026-10-27-native-display
++P=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 +OUT=/Library/XeGfxTrial/m4a1-verify-$(date +%Y%m%d-%H%M%S)
 +mkdir -p "$OUT" 2>/dev/null || OUT=/tmp/m4a1-verify-$(date +%Y%m%d-%H%M%S)
 +mkdir -p "$OUT" 2>/dev/null || true
@@ -4657,9 +4660,9 @@
 +# M3d-a 安装前预检（只读）：五件套产物存在/骰子/版本/关键符号/签名，并列出安装命令。
 +# 用法：./tools/preflight-m3d.sh
 +set -u
-+B=${XE_CODEX_ROOT:-$HOME/Documents/Codex}/2026-10-25-xegfx-build-0044
-+N=${XE_CODEX_ROOT:-$HOME/Documents/Codex}/2026-10-23/d/outputs/Intel-iGPU-275HX-20261023/src/NvGfx
-+ND=${XE_CODEX_ROOT:-$HOME/Documents/Codex}/2026-10-27-native-display
++B=${XEGFX_BUILD_ROOT:?set XEGFX_BUILD_ROOT to the external component build root}
++N=${XEGFX_PROJECT_ROOT:?set XEGFX_PROJECT_ROOT to the external project/build tree}/src/NvGfx
++ND=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 +FAIL=0
 +
 +check() { # check <name> <bundle> <ident> <binname> <want_version> <strings...>
