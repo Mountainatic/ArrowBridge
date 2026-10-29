@@ -32,7 +32,7 @@
 # 可调环境变量：
 #   DURATION_MIN  总时长（分钟，默认 20）
 #   OUT           输出目录（默认 $PWD/soak-<YYYYmmdd-HHMMSS>）
-#   XE_TOOLS_DIR  负载程序源码目录（默认脚本所在目录的 tools/）
+#   XEGFX_TOOLS_DIR  负载程序源码目录（默认脚本所在目录的 tools/）
 #   ROUND_SEC     每轮秒数（默认 75，建议 60-90）
 #   SAMPLE_SEC    采样间隔秒（默认 10）
 #   CA_EVERY      每隔多少秒再补一个 ca_bench2 实例（默认 6；ca_bench2 自身约 7s 结束）
@@ -50,7 +50,7 @@ set -u
 # ---------------------------------------------------------------- 0. 基本参数
 # Load programs build from the sources shipped next to this script unless explicitly overridden.
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-TOOLS="${XE_TOOLS_DIR:-$HERE/tools}"
+TOOLS="${XEGFX_TOOLS_DIR:-$HERE/tools}"
 BENCH_SRC="$TOOLS/ca_bench2.m"
 BENCH_BIN=/tmp/ca_bench2
 CHURN_SRC="$TOOLS/soak_surface_churn.m"
