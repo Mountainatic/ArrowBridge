@@ -4661,7 +4661,7 @@
 +# 用法：./tools/preflight-m3d.sh
 +set -u
 +B=${XEGFX_BUILD_ROOT:?set XEGFX_BUILD_ROOT to the external component build root}
-+N=${XEGFX_PROJECT_ROOT:?set XEGFX_PROJECT_ROOT to the external project/build tree}/src/NvGfx
++N=${XEGFX_NVGFX_ROOT:?set XEGFX_NVGFX_ROOT to the NvGfx source tree}
 +ND=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 +FAIL=0
 +
