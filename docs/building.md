@@ -1,116 +1,193 @@
-# 构建、安装与试验流程
+# 构建、安装与验证流程
 
-## 目标产物
+## 源码基点
 
-一次完整的部署包含五个产物：
+ArrowWhatever 使用两套 NvGfx `xe` 源码：
 
-| 产物 | 来源 | 说明 |
+| 源码范围 | 提交 | 版本 |
 | --- | --- | --- |
-| `XeGfx.kext` | NvGfx 0.0.44 + 补丁 `0001` 到 `0004` | core kext，提供 GPU 与显示引擎的 shim 层 |
-| `XeGfxAccel.kext` | XeGfx 加速器树 | 注册 head 4、执行 display-pipe 事务、提供 `debug.xegfxaccel_*` 计数器 |
-| `XeGfxIntelFB.kext` | NvGfx 0.0.44 + 补丁 `0003` | `IONDRVFramebuffer` 子类，测量面板 timing 并发布 detailed timing |
-| `XeGfxAGDC.kext` | NvGfx 0.0.44 + 补丁 `0004` | AGDC 角色，回答 K5 link-config（`0x921`） |
-| `XeMTLDriver.bundle` | 0.0.35 插件树 + 补丁 `0005` 到 `0007` | Metal 插件，把 Metal 调用转成 Vulkan/ANV |
+| XeGfx core 与显示组件 | `5a19a73f36249efb99c44c3f9cb34603ef0c0eb8` | XeGfx 0.0.44 |
+| XeMTL `plugin/` | `497d521e925bd760c8cde5bbc17d9bf96d2ee2b4` | XeGfx 0.0.35 |
 
-## 依赖
+组件补丁链：
 
-- macOS 26.7.1（25G241）与 Xcode Command Line Tools，SDK 用系统自带的版本
-- NvGfx 0.0.44 源码树与 0.0.35 源码树（取法见 `patches/README.md`）
-- core 构建所需的 Linux/i915 源码快照：Linux 内核源码、FreeBSD 头文件、drm-kmod 与 linux-firmware 固件，本机放在 `~/src/xe-src` 下，构建脚本从该目录读取
-- accel 构建所需的 NVIDIA Open GPU Kernel Modules 610.57.04 源码（本项目使用的 XeGfx 加速器树由它派生）
-- 插件构建所需的 Vulkan-Headers 与 translator 组件，二者都来自 NvGfx 树
-- 安装阶段需要 root；内核扩展与插件都在重启后生效
+| 组件 | 补丁链 |
+| --- | --- |
+| XeGfx core / xkpi | `0001 → 0008 → 0011 → 0020 → 0022` |
+| XeGfxAccel | `0002 → 0009 → 0012` |
+| XeGfxIntelFB | `0003 → 0010 → 0014` |
+| XeGfxAGDC | `0004 → 0013 → 0017` |
+| XeGfxDisplay | `0015 → 0018 → 0021` |
+| native-display tools | `0016 → 0019` |
+| XeMTL | `0005 → 0006 → 0007` |
 
-## 构建 core
+完整逐补丁前置状态与应用命令见 [../patches/README.md](../patches/README.md)。
 
-在打过前四个补丁的 0.0.44 源码树里执行：
+## 构建依赖
+
+- macOS Tahoe 26.7.1 与 Xcode Command Line Tools
+- XeGfx 构建所需的 Linux/i915、FreeBSD、drm-kmod 与 firmware 源码
+- kcabi 检查工具
+- XeGfxAccel 构建所需的 NVIDIA Open GPU Kernel Modules 源码
+- XeMTL 构建所需的 Vulkan-Headers 与 translator 组件
+- 安装与 AuxKC 重建所需的管理员权限
+
+外部源码目录由 `XEGFX_SRC`、`XEGFX_KCABI`、`XEGFX_NVGFX_ROOT`、`XEGFX_BUILD_ROOT` 等环境变量传入。仓库内工具通过脚本自身位置定位。
+
+## 构建产物
+
+一次完整部署包含五个 kext 与一个 Metal plugin bundle：
+
+| 产物 | 补丁链 | 作用 |
+| --- | --- | --- |
+| `XeGfx.kext` | `0001 → 0008 → 0011 → 0020 → 0022` | GPU core、boot-arm、VBT/KMS、AUX、K1 eDP readout |
+| `XeGfxAccel.kext` | `0002 → 0009 → 0012` | display-pipe、zero-copy present、adapter/accel contract |
+| `XeGfxIntelFB.kext` | `0003 → 0010 → 0014` | panel timing、detailed timing、L0 ready |
+| `XeGfxAGDC.kext` | `0004 → 0013 → 0017` | AGDC/K5 与启动阶段显示映射 |
+| `XeGfxDisplay.kext` | `0015 → 0018 → 0021` | KMS framebuffer adapter、scanout、EDID/DDC |
+| `XeMTLDriver.bundle` | `0005 → 0006 → 0007` | Metal → Vulkan/ANV |
+
+## 构建 XeGfx core
+
+在 0.0.44 源码树完成 core 补丁链后执行：
 
 ```sh
 bash build/nvgfx/build_xegfx.sh
 ```
 
-脚本从 `~/src/xe-src` 收集 i915、LinuxKPI 与 drm 对象，先跑 `gpu/xegfx/harness/score.py` 核对“每一个源文件都被编进去了”，再调用 `gpu/xegfx/tools/link.sh` 做 KPI 符号、shadow 符号与 kcabi 检查。产物落在 `gpu/xegfx/out/XeGfx.kext`。
+构建流程包含源文件覆盖检查、KPI 符号检查、shadow 检查与 kcabi 检查，产物位于：
 
-## 构建 framebuffer 与 AGDC
-
-两个 kext 的构建入口都在 `build/nvgfx/` 下：
-
-```sh
-bash build/nvgfx/build_xegfxintelfb.sh   # -> XeGfxIntelFB/XeGfxIntelFB.kext
-bash build/nvgfx/build_xegfxagdc.sh      # -> XeGfxAGDC/XeGfxAGDC.kext
+```text
+gpu/xegfx/out/XeGfx.kext
 ```
 
-脚本默认从 `/Library/Developer/CommandLineTools/SDKs/MacOSX15.5.sdk` 取 SDK，用 `clang++ -fapple-kext -mkernel -std=c++17 -fno-rtti -fno-exceptions` 编译，链接参数是 `-nostdlib -Xlinker -kext -lkmodc++ -lkmod -lcc_kext`，最后用 ad-hoc 签名。产物根目录由 `OUTROOT` 控制。
+## 构建显示组件
 
-## 构建 accel
+XeGfxIntelFB 与 XeGfxAGDC：
 
-加速器来自项目的 XeGfx 加速器树，入口在 `build/` 下：
+```sh
+bash build/nvgfx/build_xegfxintelfb.sh
+bash build/nvgfx/build_xegfxagdc.sh
+```
+
+XeGfxAccel：
 
 ```sh
 bash build/accel_build.sh
 ```
 
-产物以 `.kext` 目录形式输出到构建根目录的 `XeGfxAccel/26/` 下。安装脚本 `install_upstream_accel.py` 会在暂存阶段修改 `Info.plist` 的两个键，把 Metal 插件类名指向本机的 XeMTL 插件：
-
-- `MetalPluginClassName = XeMTLDevice`
-- `MetalPluginName = ../../../Library/GPUBundles/XeMTLDriver`
-
-## 构建插件
-
-插件先在 0.0.35 的干净插件树上应用补丁 `0005`、`0006`、`0007`，然后分两步构建：先构建 translator，再构建插件 bundle。
+XeGfxDisplay：
 
 ```sh
-bash build/nvgfx/build_xlate.sh    # translator dylib，插件在运行期加载
-bash build/nvgfx/build_plugin.sh   # XeMTLDriver.bundle
+bash tools/build-xegfxdisplay.sh
 ```
 
-插件以 `clang -bundle` 方式构建，链接 `Foundation`、`Metal`、`IOSurface`、`IOKit` 与 `CoreFoundation`，输出目录布局为 `XeMTLDriver.bundle/Contents/MacOS/XeMTLDriver`，`Info.plist` 里写 `MetalPluginName = XeMTLDriver`、`MetalPluginClassName = XeMTLDevice`。构建完成后对 bundle 做 ad-hoc 签名，再复制到 `/Library/GPUBundles/XeMTLDriver.bundle`。
+`SDKROOT` 可以指定当前 Command Line Tools 提供的 macOS SDK。
+
+## 构建 XeMTL
+
+在 `497d521e` 的 `plugin/` 树应用 `0005 → 0006 → 0007`，随后构建 translator 与 plugin：
+
+```sh
+bash build/nvgfx/build_xlate.sh
+bash build/nvgfx/build_plugin.sh
+```
+
+最终 bundle 为：
+
+```text
+XeMTLDriver.bundle/Contents/MacOS/XeMTLDriver
+```
+
+Metal personality使用：
+
+```text
+MetalPluginName      = ../../../Library/GPUBundles/XeMTLDriver
+MetalPluginClassName = XeMTLDevice
+```
 
 ## 安装与 AuxKC
 
-三个安装脚本用同一套流程：校验产物的 bundle id 与 personality，备份现有 kext 与 AuxKC，复制、设置属主与权限、重新签名，然后重建辅助内核集合。
+0016 工具集提供产物检查、事务安装、AuxKC 重建、bootguard、health 与 rollback。
+
+安装前先运行：
 
 ```sh
-sudo python3 scripts/install_core_044.py       # core -> /Library/Extensions/XeGfx.kext
-sudo python3 scripts/install_upstream_accel.py # accel -> /Library/Extensions/XeGfxAccel.kext
-sudo python3 scripts/install_xeintelfb.py      # framebuffer -> /Library/Extensions/XeGfxIntelFB.kext
+bash tools/preflight-m3d.sh
 ```
 
-重建 AuxKC 的核心命令来自脚本，形态如下（`-A` 逐个列出候选集合里的全部 bundle）：
+`tools/install-m3d.py` 接受五个 kext 的显式路径：
 
 ```sh
-kmutil create -n aux --volume-root / --allow-missing-kdk \
-  -B /System/Library/KernelCollections/BootKernelExtensions.kc \
-  -S /System/Library/KernelCollections/SystemKernelExtensions.kc \
-  --repository /Library/Extensions \
-  --repository /Library/Apple/System/Library/Extensions \
-  -A <candidate bundle> ... -z
+sudo python3 tools/install-m3d.py \
+  --core    /path/to/XeGfx.kext \
+  --adapter /path/to/XeGfxDisplay.kext \
+  --accel   /path/to/XeGfxAccel.kext \
+  --agdc    /path/to/XeGfxAGDC.kext \
+  --intelfb /path/to/XeGfxIntelFB.kext
 ```
 
-脚本随后用 `kmutil inspect -a x86_64 -A` 核对候选版本，并确认没有其他 bundle 被意外改动；任何一项不符合预期都会回滚到备份的 AuxKC。AGDC 的安装沿用同一模式，把 `XeGfxAGDC.kext` 放进 `/Library/Extensions/` 后重建 AuxKC。
+安装事务依次完成 bundle 检查、暂存、ad-hoc 签名、`/Library/Extensions` 更新与 AuxiliaryKernelExtensions.kc 重建，并把备份与状态记录写入 `/Library/XeGfxTrial`。
 
-安装完成后重启，让新 kext 进入 AuxKC 并加载。
+XeMTL 安装到：
 
-## 试验流程
+```text
+/Library/GPUBundles/XeMTLDriver.bundle
+```
 
-`scripts/run_upstream_trial4.sh` 把一次完整试验串起来，步骤按顺序是：
+## 启动配置
 
-1. 加载 core kext，设置 `debug.xegfx_env`（关闭 i915 自带显示、启用 GuC）、看门狗周期与 `debug.xegfx_stage=2`，确认阶段到位
-2. 加载 accel kext，读取 `heads_published` 等计数器
-3. 推进 headless 阶段 4 到 7，注册 head 4 并发布 display-pipe 能力
-4. 打开 `debug.xegfx_agdc=1` 与 `debug.xegfx_agdc_k5=1`，触发面板 timing 测量，读取 `debug.xegfx_panel_probe_result`
-5. 打开 `debug.xegfxaccelfb=1`、`debug.xegfxaccel_iop=1`，核对 `heads_published/registered/piped = 16`
-6. 准备插件允许文件与 first-loss journal sentinel，做一次 WindowServer 重启
-7. 采集 200 秒遥测、WindowServer 采样与统一日志，再收尾
+boot-arm 负责启动阶段的 XeGfx stage 1–7 与后续显示组件衔接。K1 eDP readout 使用：
 
-关键 sysctl 分布在三个 kext：core 侧是 `debug.xegfx_*`，accel 侧是 `debug.xegfxaccel_*`，AGDC 侧是 `debug.xegfx_agdc*` 与 `debug.xegfx_panel_*`。用户态探针 `scripts/tools/display_probe.c` 与 `modes_list.c` 用来核对刷新率与模式列表。
+```text
+xegfx-disp-kms=1
+```
 
-## 回退与保护
+启动链依次形成：
 
-显示通路的试验有可能在注册写入之后冻结整机，因此项目保留了三层保护：
+```text
+XeGfx stage 1–7
+→ XeGfxDisplayNub
+→ AUX EDID/DPCD
+→ K1 eDP readout
+→ XeGfxDisplay framebuffer / scanout
+→ XeGfxAccel
+→ XeGfxAGDC / K5
+→ WindowServer / XeMTL / ANV
+→ display-pipe
+```
 
-- 启动键盘参数 `-xeintelfboff` 关闭 `XeGfxIntelFB` 的接管
-- NVRAM 计数 `xeintelfb-starts` 连续两次异常启动后，framebuffer 探针主动拒绝加载，回到 Apple 的 `IONDRVFramebuffer`
-- accel 的 head 4 注册默认关闭，写入 `debug.xegfxaccelfb=1` 才打开；重启即恢复默认
+## 启动后验证
 
-安装脚本回滚 AuxKC 与 kext；插件侧删除 `/Library/GPUBundles/xemtl-allow.txt` 与 `/private/tmp/xemtl-first-loss-enable` 即可回到未启用状态。
+`tools/m4a2-verify.sh` 采集 kext、IOFramebuffer、claim node、core、display nub、accel、Metal、用户态与内核日志：
+
+```sh
+bash tools/m4a2-verify.sh --strict
+```
+
+重点检查：
+
+- XeGfx stage 1–7 完成状态
+- `XeGfxDisplayNub` 与 KMS KAPI
+- EDID/DPCD 发布状态
+- K1 connector、fixed mode、CRTC 与活动 pipe readout
+- `XeGfxIntelKMSFramebuffer` 与 scanout
+- XeGfxAccel head / pipe / present 计数
+- AGDC/K5 映射状态
+- WindowServer 的 XeMTL Metal 枚举与 display-pipe 提交
+
+K1 的当前试验范围是 eDP 状态读取。modeset、HBR3、DSC 与 240 Hz 沿同一显示链继续推进。
+
+## 稳定性与回归
+
+userptr 与图形负载使用：
+
+```sh
+bash scripts/soak_userptr_test.sh
+```
+
+刷新节拍和模式列表使用 `scripts/tools/display_probe.c` 等探针。bootguard、health 输出、统一日志与 `/Library/XeGfxTrial` 中的事务记录用于启动链回归。
+
+## 回滚
+
+安装事务在 `/Library/XeGfxTrial` 保存 kext、AuxKC 与状态记录。0016 提供对应 rollback 工具恢复安装前状态；bootguard 同时记录每次 claim boot 的健康结果。
