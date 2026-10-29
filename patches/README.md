@@ -54,30 +54,25 @@
 
 ## 应用方法
 
-在 0.0.44 的源码树根目录依次应用前四个补丁，再补上零拷贝与 detailed timings 的三个补丁（0008 建立在 0001 之上、0009 建立在 0002 之上、0010 建立在 0003 之上）：
+在 XeGfx 0.0.44 基点 `5a19a73f` 上应用 core 与显示组件补丁：
 
 ```sh
 cd NvGfx-5a19a73
-patch -p1 < /path/to/patches/0001-xg_vm-userptr-race.patch
-patch -p1 < /path/to/patches/0002-accel-vblank-and-head4.patch
-patch -p1 < /path/to/patches/0003-intelfb-panel-timing.patch
-patch -p1 < /path/to/patches/0004-agdc-k5-panel-timing.patch
-patch -p1 < /path/to/patches/0008-core-ggtt-flip-slots.patch
-patch -p1 < /path/to/patches/0009-accel-zero-copy-flip.patch
-patch -p1 < /path/to/patches/0010-intelfb-detailed-timings.patch
-```
 
-原生显示栈（0011–0022）接着叠在同一棵 0.0.44 树上。0011–0016 是此前只在本机 native-display 工作区存在的基点（core 的 M0–M4a 显示钩子、加速器、AGDC、IntelFB、XeGfxDisplay 适配器与脚本），0017–0022 是在它之上的修复：
+for n in 0001 0002 0003 0004 0008 0009 0010 0011 0012; do
+  patch -p1 < /path/to/patches/$n-*.patch
+done
 
-```sh
-for n in 0011 0012; do patch -p1 < /path/to/patches/$n-*.patch; done
 patch -p1 -E < /path/to/patches/0013-agdc-m3d-in-kernel-arm.patch
-for n in 0014 0015 0016 0017 0018 0019 0020 0021 0022; do patch -p1 < /path/to/patches/$n-*.patch; done
+
+for n in 0014 0015 0016 0017 0018 0019 0020 0021 0022; do
+  patch -p1 < /path/to/patches/$n-*.patch
+done
 ```
 
-`0013` 删除 0004 加入的两个时序头文件，带 `-E` 才会把清空的文件一并删掉。
+`0013` 会移除两个时序头文件，`-E` 用于同步删除应用后为空的文件。
 
-插件补丁换成 0.0.35 的源码树，按 0005、0006、0007 的顺序应用：
+在 XeGfx 0.0.35 基点 `497d521e` 的 `plugin/` 上应用 XeMTL 补丁：
 
 ```sh
 cd NvGfx-497d521
@@ -86,21 +81,17 @@ patch -p1 < /path/to/patches/0006-plugin-host-import.patch
 patch -p1 < /path/to/patches/0007-plugin-first-loss-journal.patch
 ```
 
-`0005` 里 `plugin/NVMTLDevice.m` 被删除、`plugin/XeMTLDevice.m` 被加入，因此应用时带 `--remove-empty-files` 更干净。
-
-0.0.44 组件链应用于 core、accel、IntelFB、AGDC 与 XeGfxDisplay；0.0.35 的 `plugin/` 依次应用 `0005 → 0006 → 0007`。插件链重放后得到 33 个文件，`nvmtl_range_writable` 标记存在。
+`--remove-empty-files` 用于处理 `0005` 中的文件替换。最终得到当前 core/display 源码树与 XeMTL plugin 源码树。
 
 ## 验证方式
 
-项目在生成补丁时对每个补丁做了两向验证：
+补丁系列使用对应上游基点进行重放验证：
 
-1. 把补丁应用到对应基点的干净源码树，再与项目里实际参与编译的源码目录做逐文件比对
-2. 对插件系列验证三点闭环：0.0.35 干净插件树 + 0005 + 0006 + 0007 等于项目里的插件源码树
+1. 在 `5a19a73f` 上按组件链应用 core、accel、IntelFB、AGDC、XeGfxDisplay 与 tools 补丁
+2. 在 `497d521e` 的 `plugin/` 上应用 `0005 → 0006 → 0007`
+3. 对补丁后的源码文件与实际构建输入做逐文件比对
+4. 检查 unified diff 应用结果、符号标记与新增文件
 
-四个 kext 补丁的比对目标是：`xg_vm.c` 对照 core 树，`nvrm-accel.cpp` 与 `xegfx_accel_names.h` 对照 accel 树，`intelfb.cpp` 与三个新头文件对照 framebuffer 树，AGDC 的四项对照 AGDC 树。验证结果全部一致，验证脚本只在本机运行过，没有放进仓库。
+当前 0.0.44 组件链与 XeMTL plugin 链均可完整重放，应用结果为 `OK`，没有 `.rej`。native-display tools 使用脚本自身位置解析仓库内文件，外部源码树与构建产物通过 `XEGFX_*` 环境变量传入。
 
-零拷贝与 detailed timings 的三个补丁（0008–0010）同样在 0.0.44 干净树上验证：先应用 0001、0002、0003，再应用 0008、0009、0010，全部 `OK`；应用后 `xg_i915_flip.c`（新增）、`nvrm-accel.cpp`、`intelfb.cpp` 与项目工作树逐字节一致。这一组验证没有依赖 0004–0007（AGDC 与插件补丁，与这三个文件无关）。
-
-原生显示栈 0011–0022 也在同一棵干净树上验证：0001–0004、0008–0010 之后依次应用 0011–0016，结果与本机的会话前工作树逐文件一致；再应用 0017–0022，`gpu/xkpi`、`xg_kext.cpp`、`xg_i915.h` 与 core 源码树一致，加速器、AGDC、IntelFB 与当前编译用的 kext 源码一致，适配器与当前安装的 XeGfxDisplay 源码一致，全部 `OK`、没有 `.rej`。脚本不再依赖开发机的日期工作目录：仓库内 `tools/` 互相引用时从脚本自身位置解析，仓库外源码树与构建产物通过 `XEGFX_*` 环境变量显式指定；`/Library`、`/System`、`/usr` 等系统路径保持绝对路径。
-
-补丁不包含绝对路径、时间戳无关的行号偏移，也不包含构建产物。补丁可以重复生成，生成的源头是第 2 节列出的两个上游提交以及本机项目树。
+补丁来源由上面的两个固定上游提交和当前项目源码状态共同确定。
