@@ -19,22 +19,22 @@
 
 三个安装脚本与试验脚本都支持路径覆盖，默认值与本机项目布局一致：
 
-| 变量 | 脚本 | 默认值 |
+| 变量 | 脚本 | 作用 |
 | --- | --- | --- |
-| `XE_CORE_SRC` | `install_core_044.py` | `$HOME/Documents/Codex/2026-10-23/…/src/NvGfx/gpu/xegfx/out/XeGfx.kext` |
-| `XE_ACCEL_SRC` | `install_upstream_accel.py` | `$HOME/Documents/Codex/2026-10-25-xegfx-build-0044/XeGfxAccel/26/XeGfxAccel.kext` |
-| `XE_INTELFB_SRC` | `install_xeintelfb.py` | `$HOME/Documents/Codex/2026-10-25-xegfx-build-0044/XeGfxIntelFB/XeGfxIntelFB.kext` |
-| `XE_PROJECT_ROOT` | `run_upstream_trial4.sh` | `$HOME/Documents/Codex/2026-10-23/…/Intel-iGPU-275HX-20261023` |
-| `XE_NI_DIR` | `run_upstream_trial4.sh`、`soak_userptr_test.sh` | `$HOME/Documents/Codex/2026-10-24/ni` |
-| `XE_TOOLS_DIR` | `soak_userptr_test.sh` | 脚本所在目录下的 `tools/` |
-| `DURATION_MIN`、`OUT`、`ROUND_SEC`、`SAMPLE_SEC` 等 | `soak_userptr_test.sh` | 见脚本头部注释 |
+| `XE_CORE_SRC` | `install_core_044.py` | **必填**，待安装的 `XeGfx.kext` 构建产物 |
+| `XE_ACCEL_SRC` | `install_upstream_accel.py` | **必填**，待安装的 `XeGfxAccel.kext` 构建产物 |
+| `XE_INTELFB_SRC` | `install_xeintelfb.py` | **必填**，待安装的 `XeGfxIntelFB.kext` 构建产物 |
+| `XE_PROJECT_ROOT` | `run_upstream_trial4.sh`、`run_upstream_trial5.sh` | **必填**，外部项目/构建树；其中应存在 `build/tools/display-route-snapshot` |
+| `XE_HELPER_DIR` | `run_upstream_trial4.sh`、`run_upstream_trial5.sh` | **必填**，包含 `continue_headless_stage4_7.py` 的 helper 目录 |
+| `XE_TRIAL_ROOT` | trial 脚本 | 试验输出目录，默认 `/Library/XeGfxTrial` |
+| `XE_TOOLS_DIR` | `soak_userptr_test.sh` | 负载程序源码目录，默认当前仓库的 `scripts/tools/` |
 
 ## 未随仓库提供的依赖
 
 以下文件属于项目私有资产，体积或性质不适合放进仓库，脚本会从项目目录读取：
 
 - `continue_headless_stage4_7.py`：core kext 的 headless 阶段推进脚本，`run_upstream_trial4.sh` 在 `XE_NI_DIR` 下寻找
-- `build/tools/display-route-snapshot`、`build/tools/drm*` 等 display 与 DRM 探针，`run_upstream_trial4.sh` 用 `XE_PROJECT_ROOT` 定位
+- `build/tools/display-route-snapshot`、`build/tools/drm*` 等 display 与 DRM 探针，trial 脚本通过 `XE_PROJECT_ROOT` 定位
 - 已编译的 kext：三个安装脚本需要现成的 `.kext` 目录，编译方法见 `docs/building.md`
 - 已编译的 `/Library/GPUBundles/XeMTLDriver.bundle`：加速器需要一个 Metal 插件，源码由补丁 0005 到 0007 生成
 
