@@ -7,9 +7,9 @@ plugin bundle is XeMTLDriver / class XeMTLDevice, so the staged Info.plist is pa
 Nothing changes until the next reboot."""
 import datetime, json, os, pathlib, plistlib, re, shutil, subprocess, sys, plistlib as pl
 
-_src = os.environ.get("XE_ACCEL_SRC")
+_src = os.environ.get("XEGFX_ACCEL_KEXT")
 if not _src:
-    raise SystemExit("XE_ACCEL_SRC is required; point it at the kext build artifact to install")
+    raise SystemExit("XEGFX_ACCEL_KEXT is required; point it at the kext build artifact to install")
 SRC = pathlib.Path(_src).expanduser().resolve()
 DEST = pathlib.Path("/Library/Extensions/XeGfxAccel.kext")
 KC = pathlib.Path("/Library/KernelCollections/AuxiliaryKernelExtensions.kc")
