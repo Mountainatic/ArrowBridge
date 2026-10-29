@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """Install the XeGfx 0.0.44 core kext (disk layer only) and rebuild the AuxKC.
 
-Sanitised copy of the project install script: XE_CORE_SRC overrides the build artifact
-path, which otherwise defaults to $HOME/Documents/Codex/<project>/src/NvGfx/gpu/xegfx/out/XeGfx.kext.
-Run as root on the test machine; nothing changes until the next reboot."""
+The source build artifact is never guessed from a developer workspace. Set XE_CORE_SRC
+to the kext you intend to install. Run as root on the test machine; nothing changes
+until the next reboot."""
 import datetime, json, os, pathlib, plistlib, re, shutil, subprocess, sys
 
-SRC = pathlib.Path(os.environ.get("XE_CORE_SRC") or
-                   pathlib.Path.home() / "Documents/Codex/2026-10-23/d/outputs/Intel-iGPU-275HX-20261023" /
-                   "src/NvGfx/gpu/xegfx/out/XeGfx.kext")
+_src = os.environ.get("XE_CORE_SRC")
+if not _src:
+    raise SystemExit("XE_CORE_SRC is required; point it at the kext build artifact to install")
+SRC = pathlib.Path(_src).expanduser().resolve()
 DEST = pathlib.Path("/Library/Extensions/XeGfx.kext")
 KC = pathlib.Path("/Library/KernelCollections/AuxiliaryKernelExtensions.kc")
 TRIALS = pathlib.Path("/Library/XeGfxTrial")
