@@ -1,0 +1,159 @@
+# 0019 tools: guard scripts accept the new class, report the right IOP counters, optional persistent arm
+#
+# Base:  tools/ from 0016 (m4a2 bootguard set)
+# Files: tools/m3db-health.py, tools/xegfx-ws-preflight.py, tools/m4a2-verify.sh, tools/m3db-preflight.sh,
+#        tools/m3db-control.py
+# Apply: patch -p1 < patches/0019-guard-tools-class-name-and-keep-armed.patch
+#
+# - health/ws-preflight/verify compared the adapter class by exact name and would have failed the claim after
+#   0018; they accept XeGfxIntelKMSFramebuffer, and health fails a class without "Intel" (CoreDisplay would turn
+#   IOPresentment off).
+# - health reports pipe_perform / iop_xe_flips / iop_ok.  iop_ok only counts the copy path; a direct-flip desktop
+#   shows iop_ok=0 although every frame goes through IOPresentment.
+# - m3db-control.py arm --keep-armed writes M4A2_DISARM_ON_SUCCESS=0, so a successful claim boot no longer
+#   returns the next boot to IntelFB; a failed boot still falls back.
+# - m3db-preflight.sh: node count for the new class; PIN_* lines are this machine's installed builds.
+#
+--- a/tools/m3db-health.py
++++ b/tools/m3db-health.py
+@@ -18,13 +18,20 @@
+         yield from walk(node.get('IORegistryEntryChildren', []))
+ 
+ 
++# XeGfxFramebuffer is the pre-rename adapter class; XeGfxIntelKMSFramebuffer is the one IOKit instantiates now.
++ADAPTER_FB = ('XeGfxFramebuffer', 'XeGfxIntelKMSFramebuffer')
++
++
+ def check(nodes, ws):
+     nodes = list(nodes)
+     live = lambda n: isinstance(n.get('IOServiceState'), int) and n['IOServiceState'] & 2 and not n['IOServiceState'] & 1
+-    fbs = [n for n in nodes if n.get('IOObjectClass') in ('XeGfxFramebuffer', 'XeGfxIntelFramebuffer') and live(n)]
+-    if len(fbs) != 1 or fbs[0].get('IOObjectClass') != 'XeGfxFramebuffer':
++    fbs = [n for n in nodes if n.get('IOObjectClass') in ADAPTER_FB + ('XeGfxIntelFramebuffer',) and live(n)]
++    if len(fbs) != 1 or fbs[0].get('IOObjectClass') not in ADAPTER_FB:
+         raise ValueError('claim requires one registered adapter FB and no registered IntelFB')
+     fb = fbs[0]
++    # CoreDisplay (GetGPUVendorForFramebufferService) turns IOPresentment off unless the class name contains "Intel".
++    if 'intel' not in fb['IOObjectClass'].lower():
++        raise ValueError('adapter FB class %s has no "Intel": CoreDisplay disables IOPresentment' % fb['IOObjectClass'])
+     for key in ('XeGfxFbRegistered', 'XeGfxFbOpened', 'XeGfxFbReady', 'XeGfxM3dReady', 'XeGfxScanoutReady'):
+         if fb.get(key) is not True: raise ValueError(key+' is not true')
+     if not any(n.get('IOObjectClass') == 'IOFramebufferUserClient'
+@@ -56,6 +63,10 @@
+         copies = int(run(['/usr/sbin/sysctl', '-n', 'debug.xegfxaccel_scanout_copies']).strip())
+         if copies < 1: raise ValueError('copy-only output has completed no scanout copies')
+         result['scanoutCopies'] = copies
++    # Report only: WindowServer submits display-pipe transactions only on the IOPresentment path (all 0 on the legacy
++    # path). pipe_perform counts transactions; iop_xe_flips the direct flips, iop_ok the copy path.
++    for key in ('pipe_perform', 'iop_xe_flips', 'iop_ok'):
++        result[key] = int(run(['/usr/sbin/sysctl', '-n', 'debug.xegfxaccel_' + key]).strip())
+     print(json.dumps(dict(state='claim-health-pass', **result)))
+ 
+ 
+--- a/tools/xegfx-ws-preflight.py
++++ b/tools/xegfx-ws-preflight.py
+@@ -38,14 +38,14 @@
+     fbs = []
+     for n in nodes:
+         cls = n.get('IOObjectClass')
+-        if cls not in ('XeGfxIntelFramebuffer', 'XeGfxFramebuffer'):
++        if cls not in ('XeGfxIntelFramebuffer', 'XeGfxFramebuffer', 'XeGfxIntelKMSFramebuffer'):
+             continue
+         state = n.get('IOServiceState')
+         if not isinstance(state, int):
+             raise ValueError('framebuffer IOServiceState missing; cannot establish registration')
+         # IOService.h: registered=0x2, inactive=0x1. A pull skeleton calls
+         # IOService::start, never IOFramebuffer::start/registerService.
+-        if (cls == 'XeGfxFramebuffer' and state == 0
++        if (cls in ('XeGfxFramebuffer', 'XeGfxIntelKMSFramebuffer') and state == 0
+                 and n.get('XeGfxDisplayVersion') == '0.5-pull'
+                 and n.get('XeGfxDisplayFail') is True
+                 and n.get('XeGfxFbRegistered') is False
+--- a/tools/m4a2-verify.sh
++++ b/tools/m4a2-verify.sh
+@@ -181,16 +181,19 @@
+         pass "XeGfxIntelFramebuffer owns the display (expected outside a claim boot)"
+     elif grep -q 'class IONDRVFramebuffer' "$OUT/framebuffers.txt" 2>/dev/null; then
+         pass "Apple IONDRVFramebuffer placeholder owns the display (no trial armed)"
+-    elif grep -q 'class XeGfxFramebuffer' "$OUT/framebuffers.txt" 2>/dev/null; then
+-        warn "XeGfxFramebuffer is live although gates say no claim boot"
++    elif grep -qE 'class XeGfx(IntelKMS)?Framebuffer,' "$OUT/framebuffers.txt" 2>/dev/null; then
++        warn "the adapter framebuffer is live although gates say no claim boot"
+     else
+         warn "no recognised IOFramebuffer node found"
+     fi
+ else
+-    if grep -q 'class XeGfxFramebuffer' "$OUT/framebuffers.txt" 2>/dev/null; then
+-        pass "XeGfxFramebuffer is a live IOFramebuffer node"
++    # CoreDisplay disables IOPresentment unless the framebuffer class name contains "Intel".
++    if grep -q 'class XeGfxIntelKMSFramebuffer,' "$OUT/framebuffers.txt" 2>/dev/null; then
++        pass "XeGfxIntelKMSFramebuffer is a live IOFramebuffer node"
++    elif grep -q 'class XeGfxFramebuffer,' "$OUT/framebuffers.txt" 2>/dev/null; then
++        fail "the adapter is the pre-rename XeGfxFramebuffer class; CoreDisplay will turn IOPresentment off"
+     else
+-        fail "XeGfxFramebuffer is not an IOFramebuffer node on a claim boot"
++        fail "the adapter framebuffer is not an IOFramebuffer node on a claim boot"
+     fi
+     if grep -q 'class XeGfxIntelFramebuffer' "$OUT/framebuffers.txt" 2>/dev/null; then
+         fail "XeGfxIntelFramebuffer is still the IOFramebuffer on a claim boot (claim lost the category)"
+--- a/tools/m3db-preflight.sh
++++ b/tools/m3db-preflight.sh
+@@ -35,10 +35,10 @@
+ # ---------------------------------------------------------------- pins
+ # 与本轮审计候选及 AuxKC UUID 校验后的装机 sha 对齐。
+ # accel 同时校验本轮修复二进制 pin 与已验证的 Xe Metal personality。
+-PIN_CORE=94278c72a95862552186432f528bc2ddd43a426ebc981a90027bc5f117d12f71
++PIN_CORE=41e96cec5b437b957428a3fb129dcae465a6343a9d8b7f8b4785c5272df5646e
+ # M3d-b: downstream controller, registration, import and present audit fixes.
+-PIN_ADAPTER=b4e22af6584cbab93695f3c195653392fff68349e3f6457b57606fc6482e9e52
+-PIN_AGDC=43dfb951dc551fc91b26d9e174d80288419481148d064920bf02c1802dc5530a
++PIN_ADAPTER=ab7e9ec86a58d9c4e6dd3a11b8fe1cb8feb599602f05473157782b971f5d71e8
++PIN_AGDC=93d175c1e1ce17974cf182d26717c6232bddb21c5172f0a7c3c7b06a9762f57a
+ PIN_INTELFB=4adce586aa112e6ab9bb9ab9592f632f68055266c17f6c2bb3db518ff7d6b30e
+ 
+ u32() { # nvram key -> decimal, or "absent" / "bad:<raw>"
+@@ -188,7 +188,7 @@
+ # ---------------------------------------------------------------- 7. 当前 boot 的运行状态（参考）
+ kmutil showloaded 2>/dev/null | grep -iE 'watchthelight|nullmoth' >"$OUT/loaded.txt"
+ info "loaded: $(awk '{print $6}' "$OUT/loaded.txt" | tr '\n' ' ')"
+-for c in XeGfxFBClaim XeGfxDisplayNub XeGfxFramebuffer XeGfxIntelFramebuffer; do
++for c in XeGfxFBClaim XeGfxDisplayNub XeGfxFramebuffer XeGfxIntelKMSFramebuffer XeGfxIntelFramebuffer; do
+     info "ioreg $c nodes: $(ioreg -r -c $c 2>/dev/null | grep -c "class $c")"
+ done
+ ioreg -l -w0 -r -c XeGfxDisplayNub >"$OUT/nub.txt" 2>&1
+--- a/tools/m3db-control.py
++++ b/tools/m3db-control.py
+@@ -90,18 +90,18 @@
+     return v
+ 
+ 
+-def arm(apply, recovery):
++def arm(apply, recovery, keep_armed=False):
+     original = baseline()
+     current = boot()
+     payload = plistlib.loads((HERE/'com.xegfx.m4a2bootguard.plist').read_bytes())
+     payload.setdefault('EnvironmentVariables', {}).update(M4A2_RETRY_ONCE='0',
+-        M4A2_ARMED_FROM_BOOT=current, M4A2_DISARM_ON_SUCCESS='1', M4A2_HEALTH_CHECK=str(LIVE/'m3db-health.py'))
++        M4A2_ARMED_FROM_BOOT=current, M4A2_DISARM_ON_SUCCESS='0' if keep_armed else '1', M4A2_HEALTH_CHECK=str(LIVE/'m3db-health.py'))
+     for path in FILES.values():
+         if not path.is_file(): raise RuntimeError('missing deployment source '+str(path))
+     run(['/bin/bash', '-n', HERE/'m4a2-bootguard.sh'])
+     print(json.dumps({'plan': 'first cold claim trial', 'kextsChanged': False, 'reboot': False,
+         'managedDaemonsDisabled': MANAGED, 'armedFromBoot': current, 'futureGates': ARMED,
+-        'retryOnce': False, 'disarmOnSuccess': True}, indent=2), flush=True)
++        'retryOnce': False, 'disarmOnSuccess': not keep_armed}, indent=2), flush=True)
+     if not apply: return
+     if not recovery: raise RuntimeError('--recovery-confirmed required; record the available Recovery keyboard route')
+     if os.geteuid() != 0: raise RuntimeError('--apply requires administrator authentication')
+@@ -201,8 +201,10 @@
+     p.add_argument('--apply', action='store_true')
+     p.add_argument('--recovery-confirmed', action='store_true')
+     p.add_argument('--keep-daemon', action='store_true')
++    # every later boot claims again; a failed boot still falls back to IntelFB and needs a new arm
++    p.add_argument('--keep-armed', action='store_true', help='do not disarm after a successful claim boot')
+     args = p.parse_args()
+-    if args.action == 'arm': arm(args.apply, args.recovery_confirmed)
++    if args.action == 'arm': arm(args.apply, args.recovery_confirmed, args.keep_armed)
+     elif args.apply: disarm(args.keep_daemon)
+     else: print('DRY_RUN: stop bootguard, verify safe gates, optionally archive daemon; no system mutation')
+ 
