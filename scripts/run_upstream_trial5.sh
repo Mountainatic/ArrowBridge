@@ -11,11 +11,11 @@ set -u
 # Repository-local files are resolved from this script. The two inputs below are genuinely
 # external build/helper trees and therefore must be supplied explicitly.
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-: "${XE_PROJECT_ROOT:?set XE_PROJECT_ROOT to the external project/build tree containing build/tools/display-route-snapshot}"
-: "${XE_HELPER_DIR:?set XE_HELPER_DIR to the directory containing continue_headless_stage4_7.py}"
-ROOT="$XE_PROJECT_ROOT"
-NI="$XE_HELPER_DIR"
-TRIAL_ROOT="${XE_TRIAL_ROOT:-/Library/XeGfxTrial}"
+: "${XEGFX_PROJECT_ROOT:?set XEGFX_PROJECT_ROOT to the external project/build tree containing build/tools/display-route-snapshot}"
+: "${XEGFX_HELPER_DIR:?set XEGFX_HELPER_DIR to the directory containing continue_headless_stage4_7.py}"
+ROOT="$XEGFX_PROJECT_ROOT"
+NI="$XEGFX_HELPER_DIR"
+TRIAL_ROOT="${XEGFX_TRIAL_ROOT:-/Library/XeGfxTrial}"
 STAMP=$(date '+%Y%m%d-%H%M%S')
 TSTART=$(date '+%Y-%m-%d %H:%M:%S')
 OUT="$TRIAL_ROOT/upstream-trial-$STAMP"
