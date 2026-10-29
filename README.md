@@ -26,7 +26,7 @@
 
 4. **AUX 读取 EDID 与 DPCD**
 
-   core 根据 VBT 中的内建 eDP child 定位 AUX 通道，读取 DPCD，并通过 I2C-over-AUX 获取 EDID。当前实机读取到 384 B EDID，面板为 BOE `0x0D55`；DPCD 报告 1.4、HBR3 x4、8b/10b、DSC 1.2，并支持 AUX 背光。
+   core 根据 VBT 中的内建 eDP child 定位 AUX 通道，读取 DPCD，并通过 I2C-over-AUX 获取 EDID，同时取得链路速率、lane 数、DSC 与背光能力等面板信息。
 
    EDID 与 DPCD 以 `xegfx-edid` 和 `xegfx-dpcd` 随 display nub 发布，XeGfxDisplay 按 IOGraphicsFamily 的 DDC 接口提供给 macOS。
 
