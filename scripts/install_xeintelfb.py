@@ -8,9 +8,9 @@ The kext is new on this machine (Apple's IONDRVFramebuffer owns the panel now). 
 boot falls back to Apple's framebuffer. Nothing changes until the next reboot."""
 import datetime, json, os, pathlib, plistlib, re, shutil, subprocess, sys
 
-_src = os.environ.get("XE_INTELFB_SRC")
+_src = os.environ.get("XEGFX_INTELFB_KEXT")
 if not _src:
-    raise SystemExit("XE_INTELFB_SRC is required; point it at the kext build artifact to install")
+    raise SystemExit("XEGFX_INTELFB_KEXT is required; point it at the kext build artifact to install")
 SRC = pathlib.Path(_src).expanduser().resolve()
 DEST = pathlib.Path("/Library/Extensions/XeGfxIntelFB.kext")
 KC = pathlib.Path("/Library/KernelCollections/AuxiliaryKernelExtensions.kc")
