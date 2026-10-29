@@ -1,9 +1,13 @@
 #!/bin/bash
-# Sanitised copy (XE_NI_DIR points at the project's ni/ scripts).  Manual post-boot bring-up
-# for the 2026-10-26 23:52 iGPU config (NO boot autoload).
+# Manual post-boot bring-up using the trial script checked into this repository.
+# External build/helper trees are configured by run_upstream_trial5.sh; this wrapper never
+# reaches back into a dated development workspace.
 # Boots unaccelerated on purpose; run this once, it arms the GPU, restarts WindowServer once,
 # and leaves the K9b 60fps deferred-flip mode armed for the new WindowServer session.
 set -uo pipefail
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+TRIAL_SCRIPT="$SCRIPT_DIR/run_upstream_trial5.sh"
+[ -f "$TRIAL_SCRIPT" ] || { echo "missing trial script: $TRIAL_SCRIPT" >&2; exit 2; }
 STAMP=$(date +%Y%m%d-%H%M%S)
 L=/Library/XeGfxTrial/resume-bringup-$STAMP.log
 exec > >(tee -a "$L") 2>&1
@@ -19,7 +23,7 @@ else
   /usr/sbin/chown root:wheel /private/tmp/xemtl-ws-nowait 2>/dev/null
   /bin/chmod 644 /private/tmp/xemtl-ws-nowait 2>/dev/null
   echo "-- start proven bring-up script (run_upstream_trial5.sh) --"
-  /bin/sh "${XE_NI_DIR:-$HOME/Documents/Codex/2026-10-24/ni}/run_upstream_trial5.sh" > /private/tmp/bringup-26night.out 2>&1 &
+  /bin/sh "$TRIAL_SCRIPT" > /private/tmp/bringup-26night.out 2>&1 &
   BP=$!
   echo "bringup pid=$BP"
   for i in $(seq 1 300); do
