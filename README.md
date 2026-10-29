@@ -1,12 +1,30 @@
 # ArrowWhatever
 
-**ArrowWhatever** 是面向 Intel Arrow Lake-HX Xe-LPG 核显的 macOS 图形项目。关注于 Intel Core Ultra 9 275HX 的 Tohoe 适配，核显设备号为 `8086:7D67`，系统为 macOS Tahoe 26.7.1。目前整合 XeGfx 内核驱动、ANV Vulkan、XeMTL Metal、WindowServer 桌面合成与内屏显示链路，推进到 GGTT 槽零拷贝 flip，K9 延迟 flip 又把 GPU 完成与扫描面切换从 WindowServer 同步等待中解耦，在 2560x1600@60Hz 的当前面板上恢复到约 60fps 的加速桌面。
+**ArrowWhatever** 是面向 Intel Arrow Lake-HX Xe-LPG 核显的 macOS 图形项目，当前主要针对 Intel Core Ultra 9 275HX（`8086:7D67`）与 macOS Tahoe 26.7.1。项目已经打通 XeGfx、Mesa ANV、XeMTL、WindowServer 与内屏显示链路：加速桌面可以稳定运行，显示提交已经从整帧 CPU copy 推进到 GGTT 零拷贝 flip，并通过 K9 deferred flip 把 GPU 完成与扫描切换从 WindowServer 的同步等待中解耦。
 
-仓库保存经过验证的补丁、安装脚本、试验脚本与技术记录，上游源码从对应项目获取。同机 OpenCore 配置见 [YaoShi16-Ultra-OpenCore-efi](https://github.com/Mountainatic/YaoShi16-Ultra-OpenCore-efi)。
+最近的工作开始把原来依赖手动 bring-up 的显示链前移到驱动启动阶段：core 现在能够从 VBT 建立内建 eDP 信息，经 AUX 自动读取 EDID/DPCD，macOS 已能正确识别内建面板；在此基础上又加入了 K1 级别的 i915 eDP 只读接管，为后续同模式 modeset、240 Hz 与 DSC 做准备。
+
+仓库保存经过验证的补丁、安装/试验工具与技术记录，上游源码从对应项目获取。同机 OpenCore 配置见 [YaoShi16-Ultra-OpenCore-efi](https://github.com/Mountainatic/YaoShi16-Ultra-OpenCore-efi)。
+
+## 当前状态
+
+| 项目 | 状态 | 当前结果 |
+| --- | --- | --- |
+| Xe-LPG Metal / WindowServer | ✅ 已验证 | Intel 核显可作为 Metal 设备参与桌面合成 |
+| GGTT 零拷贝显示 | ✅ 已验证 | 三槽轮转，display-pipe 直接 flip 到 compositor surface backing |
+| K9 deferred flip | ✅ 已验证 | 2560x1600@60Hz 下恢复到约 60fps，无需 WindowServer 逐帧同步等待 |
+| 原生显示启动链 | ✅ 已进入仓库 | VBT、DisplayNub、只读 KMS KAPI、scanout、boot arm、AGDC/accel/adapter 启动链已整理为 0011–0019 |
+| EDID / DPCD 自动读取 | ✅ 实机验证 | BOE `0x0D55`，DPCD 1.4，HBR3 x4，DSC 1.2，支持 AUX 背光 |
+| macOS 内建屏身份 | ✅ 实机验证 | `AppleDisplay` 出现 `IODisplayEDID`，识别为内建面板并加载色彩描述 |
+| K1 i915 eDP takeover | 🧪 已实现，待实机运行 | i915 建立 connector/CRTC 并读取固件管线，不 sanitize、不 modeset |
+| K2 同模式 modeset | ⏳ 下一阶段 | 先让 i915 在不改变当前 raster 的前提下真正提交一次模式 |
+| K3 240 Hz + DSC / HiDPI | ⏳ 后续 | 在 K2 稳定后再切 HBR3 + DSC 与高刷新模式 |
+
+这里的“已验证”只指当前 275HX 实机上的结果；K1 已通过编译、链接、KPI 与 shadow 检查，但最新提交明确还没有做真实 GPU/display 写入试验。
 
 ## 启动方式与工作机制
 
-当前驱动以依赖分阶段拉起。系统先完整进入 macOS，再逐层启动 GPU、图形 API 与显示通路，对于常规 EDID 识别与 framebuffer 启动的路径正在补全
+早期稳定链路仍保留“系统先进入 macOS，再分阶段拉起 GPU、图形 API 与显示通路”的方式，便于回归和故障隔离。0011 之后开始把 VBT、显示 nub、scanout、AGDC、framebuffer 与 boot arm 逐步前移到驱动启动阶段；0020/0021 已经完成 EDID/DPCD 自动读取，0022 则开始让 i915 以只读方式建立 eDP/KMS 状态。
 
 1. **OpenCore 先把系统带入可操作状态**
 
@@ -57,6 +75,24 @@
    直接 no-wait 可以让 WindowServer 更快返回，但如果 GPU 尚未完成写入就立即改 `PLANE_SURF_1_A`，会出现半路呈现、撕裂和 UI 异常。ArrowWhatever 因此在 core 侧加入 `xgFlipQuery` 空闲探测，并在 XeGfxAccel 中加入 defer worker：新帧先映射到 GGTT 槽，WindowServer 提交立即返回，worker 等待 i915 engine 空闲后再 arm plane，最终仍由 vblank 锁存新 surface。
 
    这条 K9 路径由 `debug.xegfxaccel_iop_xe_defer=1` 控制，`defer_armed`、`defer_signals` 与 `wait_max_us` 提供运行时观测；`debug.xegfxaccel_iop_xe_defer=0` 可以退回同步 flip。
+
+11. **原生显示链把手动 bring-up 前移到驱动内部**
+
+   `0011–0019` 把此前只存在于本机 native-display 工作区的显示接管链整理进仓库：core 采集 VBT、发布 `XeGfxDisplayNub` 与只读 KMS KAPI，adapter 提供独立的 XeGfxDisplay framebuffer，accel/AGDC 通过内核内请求完成 arm，bootguard 负责冷启动闸门、健康检查与失败回退。
+
+   这一阶段还修了两个会直接影响 WindowServer 的问题：framebuffer 的 C++ 类名必须包含 Intel，才能让 CoreDisplay 正确识别 GPU vendor 并启用 IOPresentment；AGDC 在 framebuffer 尚未出现时也不能提前停止轮询，否则显示映射永远不会建立。
+
+12. **AUX 自动读取 EDID / DPCD，macOS 不再看到 Unknown Display**
+
+   `0020-core-aux-edid-dpcd.patch` 根据 VBT 中的内建 eDP child 找到 AUX 通道，在 i915 尚未接管显示寄存器时直接完成 DPCD 与 I2C-over-AUX EDID 读取；`0021-adapter-edid-ddc.patch` 再按照 IOGraphicsFamily 的调用语义把 EDID 交给 macOS。
+
+   当前实机读到 384 B EDID，面板为 BOE `0x0D55`；链路能力为 DPCD 1.4、HBR3 x4、8b/10b、DSC 1.2，并报告 AUX 背光支持。macOS 侧已经出现 `AppleDisplay` / `IODisplayEDID`，显示身份从 Unknown Display 收敛为内建面板。
+
+13. **K1：i915 只读接手 eDP 状态**
+
+   `0022-core-k1-staged-edp-takeover.patch` 开始真正启用 i915 的显示信息，但第一阶段仍然不修改当前固件点亮的 raster。K1 只建立内建 eDP connector/CRTC、读取 fixed modes 与当前硬件状态，并持有活动管线需要的电源引用；同时跳过 sanitize、initial commit、hotplug、fbdev 与 OpRegion 注册，避免第一步就改变正在扫描的管线。
+
+   K1 当前已经通过 424/424 编译、链接、KPI 与 shadow 检查并装机，**尚未进行实机运行验证**。后续路线是 K2 同模式提交，再到 K3 的 HBR3 + DSC + 240 Hz。
 
 ## 推进过程中解决的问题
 
@@ -126,6 +162,24 @@ K9 把这个顺序约束移到内核侧：core 的 `xg_i915_idle()` 通过 `xgFl
 完整机制、sysctl 与手动 bring-up 流程见 [docs/k9-deferred-flip.md](docs/k9-deferred-flip.md)。
 
 
+### 7. WindowServer 因 framebuffer 身份与 AGDC 时序走错路径
+
+原生显示接管初期，WindowServer 会在 `CA::OGL::Context::push_surface` 断言后循环退出。进一步检查 CoreDisplay / QuartzCore 后发现，framebuffer 的 C++ 类名不含 Intel 时，CoreDisplay 会把 GPU vendor 判错并清掉 IOPresentment；同时 AGDC 在 framebuffer 尚未出现时如果停止轮询，也会让映射永远无法建立。
+
+`0017-agdc-pending-retry.patch` 让 AGDC 在 pending 状态继续重试，`0018-adapter-intel-class-name.patch` 则用 `XeGfxIntelKMSFramebuffer` 暴露正确的 Intel framebuffer 身份。随后实机恢复 Metal 整屏合成，`pipe_perform` 与 `iop_xe_flips` 持续增长，WindowServer 不再出现原来的断言循环。
+
+### 8. Unknown Display：此前根本没有人读取 EDID
+
+显示链稳定以后，macOS 仍把内屏识别为 Unknown Display。排查后确认问题不是 EDID 内容错误，而是此前整条链上没有任何组件真正从面板读取过 EDID。
+
+`0020` 在 core 侧经 AUX 读取 EDID 与 DPCD，`0021` 修正 adapter 的 DDC 响应，包括 block 编号、built-in connection type、Apple Sense 行为以及 `IODisplay::readFramebufferEDID()` 对 `hddc` capability probe 的调用方式。修正后系统能够读取 384 B EDID，并正确建立内建 AppleDisplay。
+
+### 9. 从“沿用固件模式”开始过渡到 i915 KMS
+
+前面的零拷贝与 K9 都仍然依赖固件已经点亮的显示 raster，只改变扫描 surface；这足以稳定显示，但无法真正切换缩放分辨率、240 Hz 或 DSC。
+
+`0022` 因此把显示接管拆成 K1 → K2 → K3 三步。K1 先只读建立 i915 的 eDP/KMS 世界，不写显示寄存器；K2 再尝试提交与当前固件完全相同的模式；只有 K2 稳定后，K3 才进入 HBR3 + DSC + 240 Hz。这样把“能不能接管”与“能不能换模式”拆开，避免一次改动同时引入太多变量。
+
 ## 硬件与系统
 
 | 项目 | 取值 |
@@ -151,21 +205,32 @@ K9 把这个顺序约束移到内核侧：core 的 `xg_i915_idle()` 通过 `xgFl
 | `0008-core-ggtt-flip-slots.patch` | XeGfx 0.0.44 | GGTT 零拷贝槽、flip bridge 与 `xgFlipQuery` engine-idle 探测 |
 | `0009-accel-zero-copy-flip.patch` | 0002 之后 | GGTT 零拷贝 display flip 与 K9 defer worker |
 | `0010-intelfb-detailed-timings.patch` | 0003 之后 | 发布 IOFBDetailedTimings 与 1280x800 HiDPI 模式 |
+| `0011-core-native-display-m0-m4a.patch` | 0001/0008 之后 | VBT、DisplayNub、只读 KMS KAPI、scanout 与 boot arm |
+| `0012-accel-m3d-m4a-present-bootarm.patch` | 0009 之后 | adapter/accel present contract 与开机自动配置 |
+| `0013-agdc-m3d-in-kernel-arm.patch` | 0004 之后 | AGDC 改为内核内 arm，并移除固定时序头文件 |
+| `0014-intelfb-l0-ready.patch` | 0010 之后 | framebuffer start 完成后再发布 L0 ready |
+| `0015-adapter-xegfxdisplay-kms.patch` | 新增 | XeGfxDisplay KMS adapter |
+| `0016-tools-native-display-bringup.patch` | 新增 | M0–M4a 启动、安装、守护与验证工具 |
+| `0017-agdc-pending-retry.patch` | 0013 之后 | framebuffer 晚到时继续重试 AGDC |
+| `0018-adapter-intel-class-name.patch` | 0015 之后 | 暴露 Intel framebuffer 类名，修正 CoreDisplay vendor 识别 |
+| `0019-guard-tools-class-name-and-keep-armed.patch` | 0016 之后 | health/preflight 适配新类名并支持持久 arm |
+| `0020-core-aux-edid-dpcd.patch` | 0011 之后 | 经 AUX 自动读取 EDID/DPCD |
+| `0021-adapter-edid-ddc.patch` | 0018 之后 | 按 IOGraphicsFamily 语义提供 EDID/DDC |
+| `0022-core-k1-staged-edp-takeover.patch` | 0020 之后 | K1 i915 eDP 只读接管 |
 
 补丁的应用顺序与基点提交见 [patches/README.md](patches/README.md)。
 
 ## 构建与试验
 
 1. 克隆 [watchthelight-labs/NvGfx 的 xe 分支](https://github.com/watchthelight-labs/NvGfx/tree/xe)。
-2. core 检出 `5a19a73f`，先应用 `0001` 到 `0004`。
-3. 在同一 core 树继续应用 `0008`、`0009` 与 `0010`，补入 GGTT flip 与 detailed timings。
-4. plugin 检出 `497d521e`，依次应用 `0005` 到 `0007`。
-5. 使用 `build/nvgfx/build_xegfx.sh` 构建 XeGfx core。
-6. 使用对应构建入口生成 XeGfxAccel、XeGfxIntelFB、NVRMAGDC 与 XeMTL。
-7. 使用 `scripts/install_core_044.py`、`install_upstream_accel.py` 与 `install_xeintelfb.py` 安装并重建 AuxKC。
-8. 早期链路可以继续用 `scripts/run_upstream_trial4.sh` 做分阶段验证；当前 K9 手动 bring-up 使用 `scripts/run_upstream_trial5.sh`，`scripts/resume-bringup.sh` 则把 core、head 4、display-pipe、K9 sysctl 与单次 WindowServer 重启串成完整恢复流程。
-9. 使用 `debug.xegfxaccel_iop_xe_flip=1` 进入 GGTT 零拷贝路径；K9 另外打开 `debug.xegfxaccel_iop_xe_defer=1`，并观察 `iop_xe_flips`、`iop_xe_flip_miss`、`iop_xe_flip_fail`、`defer_armed` 与 `defer_signals`。
-10. 使用 `scripts/soak_userptr_test.sh` 做 userptr 长压测，使用 `scripts/tools/display_probe.c` 检查刷新节拍。
+2. core 检出 `5a19a73f`，应用 `0001–0004`、`0008–0010`，再按顺序叠加 `0011–0022`。其中 `0013` 需要 `patch -E` 删除已经清空的旧时序头文件。
+3. plugin 检出 `497d521e`，依次应用 `0005 → 0006 → 0007`；plugin 与 0.0.44 core 的补丁基点不要混用。
+4. 构建 XeGfx core、XeGfxAccel、XeGfxIntelFB、XeGfxAGDC、XeGfxDisplay 与 XeMTL；具体依赖与命令见 [docs/building.md](docs/building.md)。
+5. 根目录 `scripts/` 保留早期手动 bring-up 与压测流程；0016 另外提供当前原生显示链的 `tools/` 安装、preflight、bootguard、health 与 rollback 工具。
+6. 路径规则已经统一：仓库内工具从脚本自身位置解析；仓库外源码树与构建产物通过 `XEGFX_*` 环境变量显式指定；`/Library`、`/System`、`/usr` 等系统路径保持固定绝对路径。
+7. K9 基线仍可通过 `scripts/run_upstream_trial5.sh` / `resume-bringup.sh` 回归；原生显示链则按 0016 的 M0–M4a 工具逐阶段验证。
+8. `0020/0021` 的验收重点是 IORegistry 中的 `IODisplayEDID`、built-in identity 与 DPCD/EDID dump；`0022` K1 目前只应验证 readout，不应期待模式切换。
+9. 使用 `scripts/soak_userptr_test.sh` 做 userptr 长压测，使用 `scripts/tools/display_probe.c` 检查刷新节拍。
 
 完整构建说明见 [docs/building.md](docs/building.md)。
 
@@ -190,4 +255,4 @@ K9 把这个顺序约束移到内核侧：core 的 `xg_i915_idle()` 通过 `xgFl
 
 驱动主体来自 NullMoth Systems 的 macOS Metal 驱动体系。ArrowWhatever 使用 [watchthelight-labs/NvGfx 的 xe 分支](https://github.com/watchthelight-labs/NvGfx/tree/xe) 与 [watchthelight-labs/XeGfx](https://github.com/watchthelight-labs/XeGfx)，并使用 Mesa ANV、metal2vulkan、FreeBSD drm-kmod 与 Intel GuC firmware。完整来源与署名见 [NOTICE.md](NOTICE.md)。
 
-ArrowWhatever 的适用范围以当前实机验证结果为准。项目主要由 LLM 驱动构建，自用代码不一定适用于所有情况。
+ArrowWhatever 目前主要在这一台 275HX 实机上边试边改，开发过程中会大量使用 LLM 辅助查资料、写代码和排错。仓库里的结论以实际编译、日志和硬件验证为准，不保证换到其他机器上可以直接复现。
